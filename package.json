@@ -1,0 +1,16 @@
+{
+  "name": "word-dial",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "esbuild src/main.ts --bundle --format=esm --target=es2022 --sourcemap --outfile=dist/app.js",
+    "dev": "esbuild src/main.ts --bundle --format=esm --target=es2022 --sourcemap --outfile=dist/app.js --watch",
+    "typecheck": "tsc --noEmit",
+    "serve": "python3 jev_proxy.py"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.0",
+    "typescript": "^5.6.0"
+  }
+}
