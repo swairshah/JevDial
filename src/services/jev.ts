@@ -25,7 +25,22 @@ function endpoint(): string {
   return proxy.available ? '/api/jev' : JEV_DIRECT_URL;
 }
 
+const MAX_CONCURRENT = 4;
+let active = 0;
+const waiting: (() => void)[] = [];
+
 export async function systemOne(state: unknown, questions: JevQuestions): Promise<JevAnswers> {
+  while (active >= MAX_CONCURRENT) await new Promise<void>(resolve => waiting.push(resolve));
+  active++;
+  try {
+    return await request(state, questions);
+  } finally {
+    active--;
+    waiting.shift()?.();
+  }
+}
+
+async function request(state: unknown, questions: JevQuestions): Promise<JevAnswers> {
   const headers: Record<string, string> = { 'Content-Type': 'application/json', Accept: 'application/json' };
   if (settings.tsKey) headers.Authorization = `Bearer ${settings.tsKey}`;
   let r: Response;

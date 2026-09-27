@@ -14,6 +14,8 @@ export interface CardRecord {
   text: string;
   specs: QuestionSpec[] | null;
   baseline: Classification | null;
+  expected?: Record<string, string>;
+  source?: { dataset: string; difficulty: 'typical' | 'borderline'; note: string };
 }
 
 export interface CardDeps {
@@ -43,7 +45,16 @@ export class SentenceCard {
       h('button', { class: 'icon-btn sm', html: icons.reset, attrs: { title: 'Reset to original', 'aria-label': 'Reset' }, on: { click: () => this.resetToOriginal() } }),
       h('button', { class: 'icon-btn sm', html: icons.close, attrs: { title: 'Remove', 'aria-label': 'Remove' }, on: { click: () => this.deps.onRemove(this) } })
     );
-    this.el = h('article', { class: 'card' }, actions, this.dial.el, this.statusEl, this.panel.el);
+    const src = record.source;
+    const meta = src
+      ? h(
+          'div',
+          { class: 'card-meta' },
+          h('span', { text: src.dataset }),
+          src.difficulty === 'borderline' ? h('span', { class: 'pill warn', text: 'borderline', attrs: { title: src.note || 'Could reasonably be labelled two ways' } }) : null
+        )
+      : null;
+    this.el = h('article', { class: 'card' }, actions, meta, this.dial.el, this.statusEl, this.panel.el);
     this.unsubscribe.push(
       attachDial(this.dial),
       this.dial.events.on('change', ({ text }) => {
@@ -106,7 +117,7 @@ export class SentenceCard {
   }
 
   private showSpecs(specs: QuestionSpec[]): void {
-    this.panel.setSpecs(specs, next => this.editSpec(next));
+    this.panel.setSpecs(specs, next => this.editSpec(next), this.record.expected);
   }
 
   private editSpec(next: QuestionSpec): void {

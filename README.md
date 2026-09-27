@@ -48,5 +48,6 @@ src/
     Histogram.ts             one question's bars
     questions.ts             normalising specs and distributions
   feedback/                  sound clicks and haptics
-  ui/                        header, composer, sentence card, settings, theme, toast
+  dataset/                   dataset page: prompts, generation, coverage, saved datasets
+  ui/                        header, composer, sentence card, swap panel, settings, theme, toast
 ```

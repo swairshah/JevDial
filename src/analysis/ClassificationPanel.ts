@@ -13,8 +13,8 @@ export class ClassificationPanel {
     this.el.replaceChildren(...Array.from({ length: QUESTION_COUNT }, block));
   }
 
-  setSpecs(specs: QuestionSpec[], onEdit?: (next: QuestionSpec) => void): void {
-    this.histograms = specs.map(spec => new Histogram(spec, onEdit ?? null));
+  setSpecs(specs: QuestionSpec[], onEdit?: (next: QuestionSpec) => void, expected?: Record<string, string>): void {
+    this.histograms = specs.map(spec => new Histogram(spec, onEdit ?? null, expected?.[spec.id]));
     this.el.replaceChildren(...this.histograms.map(x => x.el));
     this.el.classList.add('pending');
   }

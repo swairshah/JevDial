@@ -165,15 +165,16 @@ function updateSettings(patch) {
 
 // src/analysis/questions.ts
 var clean = (v) => typeof v === "string" ? v.trim().replace(/\s+/g, " ") : "";
-function normalizeQuestions(raw) {
+function normalizeQuestions(raw, max = QUESTION_COUNT) {
   const specs = [];
   for (const q of raw ?? []) {
     const name = clean(q.name);
     const seen = /* @__PURE__ */ new Set();
     const options = (q.options ?? []).map((o) => ({ label: clean(o.label).toLowerCase(), description: clean(o.description) })).filter((o) => o.label && !seen.has(o.label) && seen.add(o.label)).slice(0, 8);
     if (!name || options.length < 2) continue;
-    specs.push({ id: `q${specs.length + 1}`, name, question: clean(q.question) || name, options });
-    if (specs.length === QUESTION_COUNT) break;
+    const kind = q.kind === "scale" || q.kind === "category" ? q.kind : void 0;
+    specs.push({ id: `q${specs.length + 1}`, name, question: clean(q.question) || name, options, ...kind ? { kind } : {} });
+    if (specs.length === max) break;
   }
   if (!specs.length) throw new Error("The model did not propose any usable questions");
   return specs;
@@ -426,7 +427,7 @@ function chatJSON(messages, schema, options = {}) {
       if (parsed) return parsed;
       console.warn("Word Dial: unparseable LLM response", data);
       lastError = `finish_reason=${finish}, content=${JSON.stringify(content.slice(0, 80))}`;
-      if (finish === "length") maxTokens = Math.min(maxTokens * 2, 6e3);
+      if (finish === "length") maxTokens = Math.min(maxTokens * 2, 16e3);
     }
     throw new Error(`Model did not return JSON (${lastError.slice(0, 200)})`);
   });
@@ -438,7 +439,20 @@ function endpoint() {
   if (settings.jevEndpoint && settings.jevEndpoint !== "auto") return settings.jevEndpoint;
   return proxy.available ? "/api/jev" : JEV_DIRECT_URL;
 }
+var MAX_CONCURRENT = 4;
+var active2 = 0;
+var waiting2 = [];
 async function systemOne(state, questions) {
+  while (active2 >= MAX_CONCURRENT) await new Promise((resolve) => waiting2.push(resolve));
+  active2++;
+  try {
+    return await request(state, questions);
+  } finally {
+    active2--;
+    waiting2.shift()?.();
+  }
+}
+async function request(state, questions) {
   const headers = { "Content-Type": "application/json", Accept: "application/json" };
   if (settings.tsKey) headers.Authorization = `Bearer ${settings.tsKey}`;
   let r;
@@ -455,6 +469,207 @@ async function systemOneBatched(state, questions, size = 40) {
   const parts = chunk(Object.entries(questions), size);
   const results = await Promise.all(parts.map((part) => systemOne(state, Object.fromEntries(part))));
   return Object.assign({}, ...results);
+}
+
+// src/dataset/prompts.ts
+var DESIGN_SYSTEM = `You are a senior annotation-scheme designer. You are building a small evaluation set for System-1 text classifiers (such as Jev and Kev). A System-1 classifier reads one short message and answers multiple-choice questions about it, returning a probability for every option. It judges only the text it is given, using the question wording and each option's one-sentence description, so those descriptions are the decision boundaries.
+
+The set will be explored interactively. A researcher takes each message, dials individual words (stronger or weaker, more positive or negative, synonyms, words that shift the topic) and watches whether the classifiers' answers move. So the scheme must be realistic for the domain and sensitive to wording: a single changed word should be able to move at least one answer.
+
+STEP 1 \u2014 Understand the setting.
+From the user's description, infer who writes these messages, to whom, through which channel, and what the person or system reading them must decide (route to a team, prioritise, reply, refund, escalate, flag for compliance...). Name that downstream decision explicitly. Good questions are the ones that decision depends on.
+
+STEP 2 \u2014 Design exactly {Q} questions with this mix:
+- CONTENT (at least two, categorical): what the message is about or asks for. Use the real taxonomy an operations team in this domain uses, not generic labels. Examples: issue type, product area, order status the writer reports, requested action, department to route to, feature mentioned.
+- AFFECT (one, a scale): sentiment, frustration, satisfaction, politeness or tone. Pick whichever matters most for the downstream decision.
+- OPERATIONAL (one): urgency, escalation risk, churn risk, required response time, or next best action.
+- If more questions are needed, add another independent dimension (customer tenure signals, compliance or safety risk, sarcasm, confidence of the claim, who is blamed). No two questions may measure the same thing.
+
+STEP 3 \u2014 Options.
+- 3 to 7 options per question, mutually exclusive, together covering nearly every realistic message.
+- Categorical questions end with "other" (or "not mentioned" for questions about a detail the message may omit) when the taxonomy is open.
+- Scales are ordered from one end to the other (e.g. very negative, negative, neutral, positive, very positive), and each step must be distinguishable in text.
+- Labels: 1 to 3 words, lowercase. Descriptions: one sentence stating the boundary with a concrete textual cue ("mentions a tracking number that hasn't updated", "threatens to cancel or leave", "asks for money back").
+- Avoid options that would almost never be chosen. Avoid "mixed" or "hybrid" options unless mixing is a real, common case in this domain.
+
+Worked example for "customer messages to an online shoe store":
+- Issue Type (category): delivery, returns & refunds, product defect, sizing & fit, payment & billing, account access, other
+- Order Status Reported (category): not yet shipped, in transit, delayed, delivered, lost, not mentioned
+- Sentiment (scale): very negative, negative, neutral, positive, very positive
+- Urgency (scale): low, normal, high, critical
+This is only an illustration of depth and specificity; design for the user's actual domain.
+
+Also return a dataset title (2 to 5 words), a one-sentence summary, and the setting (speaker, recipient, channel, decision).
+
+Reply with JSON only: {"title":string,"summary":string,"setting":{"speaker":string,"recipient":string,"channel":string,"decision":string},"questions":[{"name":string,"question":string,"kind":"category"|"scale","options":[{"label":string,"description":string}]}]}`;
+var DESIGN_SCHEMA = {
+  type: "object",
+  properties: {
+    title: { type: "string" },
+    summary: { type: "string" },
+    setting: {
+      type: "object",
+      properties: { speaker: { type: "string" }, recipient: { type: "string" }, channel: { type: "string" }, decision: { type: "string" } },
+      required: ["speaker", "recipient", "channel", "decision"],
+      additionalProperties: false
+    },
+    questions: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          name: { type: "string" },
+          question: { type: "string" },
+          kind: { type: "string", enum: ["category", "scale"] },
+          options: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: { label: { type: "string" }, description: { type: "string" } },
+              required: ["label", "description"],
+              additionalProperties: false
+            }
+          }
+        },
+        required: ["name", "question", "kind", "options"],
+        additionalProperties: false
+      }
+    }
+  },
+  required: ["title", "summary", "setting", "questions"],
+  additionalProperties: false
+};
+var ITEMS_SYSTEM = `You write realistic example messages for an evaluation set. You receive the setting (who writes, to whom, through which channel, what the reader must decide) and a classification scheme of several questions with options and boundary descriptions. Write messages exactly as real people in this setting would write them.
+
+COVERAGE is the most important requirement.
+- Every option of every question must be the intended answer for at least one message. Spread the rest so no option dominates: roughly balanced for categorical questions; for scales, cover both extremes and the middle.
+- Vary combinations. Do not always pair the same labels (not every angry message is about delivery, not every polite one is low urgency). Include some surprising but realistic combinations, such as a polite message with critical urgency, or a positive message that still reports a defect.
+- About one in five messages should be borderline: a careful annotator could hesitate between two options of one question. Mark those "borderline" and say in the note which two options compete.
+
+REALISM and VARIETY.
+- Length 6 to 40 words; most between 12 and 25. Mix one-sentence messages with two- or three-sentence ones.
+- Vary register (formal, casual, terse, rambling), who is writing ("I", "we", "my mom ordered"), and emotional temperature. A few can have lowercase starts, missing punctuation or one mild typo, as real messages do.
+- Use concrete domain details: made-up order or ticket numbers (like #48213), product or plan names, dates, amounts, times. Never use real people's names, emails or phone numbers.
+- Every message must contain at least one evaluative or intensity word that could be dialed stronger or weaker ("slow", "really", "disappointed", "great", "annoying", "a bit", "urgent"). The researcher will dial these words.
+- Do not start two messages with the same word, and do not reuse distinctive phrases across messages.
+
+LABELS.
+- For every message, give the intended label for every question, using the exact option labels from the scheme.
+- The label must follow from the text alone, judged by the option descriptions. If a detail is not in the text, choose the option for its absence (like "not mentioned") rather than guessing.
+
+Reply with JSON only: {"items":[{"text":string,"labels":[{"question":string,"label":string}],"difficulty":"typical"|"borderline","note":string}]}`;
+var ITEMS_SCHEMA = {
+  type: "object",
+  properties: {
+    items: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          text: { type: "string" },
+          labels: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: { question: { type: "string" }, label: { type: "string" } },
+              required: ["question", "label"],
+              additionalProperties: false
+            }
+          },
+          difficulty: { type: "string", enum: ["typical", "borderline"] },
+          note: { type: "string" }
+        },
+        required: ["text", "labels", "difficulty", "note"],
+        additionalProperties: false
+      }
+    }
+  },
+  required: ["items"],
+  additionalProperties: false
+};
+var DATASET_PRESETS = [
+  {
+    name: "E-commerce support",
+    description: "Customer messages sent through the chat widget of a mid-sized online store that sells clothing and shoes. They ask about orders, deliveries, returns, sizing, payments and their accounts. The support team needs to route each message to the right queue and decide how quickly to answer."
+  },
+  {
+    name: "SaaS bug reports",
+    description: "In-app feedback and bug reports from users of a project-management web app (boards, tasks, integrations, billing). Product and support triage them into the right team, judge severity, and decide whether to reply, fix or escalate."
+  },
+  {
+    name: "Bank chat",
+    description: "Messages to a retail bank\u2019s support chat about cards, transfers, fees, fraud, loans and the mobile app. Agents must spot fraud or compliance risk, route to the right team and prioritise."
+  },
+  {
+    name: "Restaurant reviews",
+    description: "Short online reviews of a neighbourhood restaurant covering food, service, price, ambience and wait times. The owner wants to know what each review is about, how the guest felt, and whether to respond publicly."
+  },
+  {
+    name: "Employee feedback",
+    description: "Anonymous comments from a quarterly employee survey at a 500-person tech company about managers, workload, pay, tools, culture and career growth. HR wants to group comments by theme, gauge morale and flag anything needing urgent follow-up."
+  }
+];
+
+// src/dataset/normalize.ts
+var str = (v) => typeof v === "string" ? v.trim() : "";
+function normalizeDesign(raw, questionCount) {
+  const specs = normalizeQuestions(raw.questions, questionCount);
+  return {
+    title: str(raw.title) || "Untitled dataset",
+    summary: str(raw.summary),
+    setting: {
+      speaker: str(raw.setting?.speaker),
+      recipient: str(raw.setting?.recipient),
+      channel: str(raw.setting?.channel),
+      decision: str(raw.setting?.decision)
+    },
+    specs
+  };
+}
+var squash = (s) => s.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+function matchSpec(specs, name) {
+  const key2 = squash(name);
+  return specs.find((s) => squash(s.name) === key2) ?? specs.find((s) => squash(s.name).includes(key2) || key2.includes(squash(s.name)));
+}
+function matchOption(spec, label) {
+  const key2 = squash(label);
+  const exact = spec.options.find((o) => squash(o.label) === key2);
+  if (exact) return exact.label;
+  return spec.options.find((o) => squash(o.label).startsWith(key2) || key2.startsWith(squash(o.label)))?.label;
+}
+function normalizeItems(raw, specs) {
+  const out = [];
+  const seen = /* @__PURE__ */ new Set();
+  for (const it of raw.items ?? []) {
+    const text = str(it.text).replace(/\s+/g, " ");
+    if (!text || seen.has(text.toLowerCase())) continue;
+    seen.add(text.toLowerCase());
+    const labels = {};
+    for (const l of it.labels ?? []) {
+      const spec = matchSpec(specs, str(l.question));
+      const label = spec && matchOption(spec, str(l.label));
+      if (spec && label) labels[spec.id] = label;
+    }
+    out.push({ id: uid(), text, labels, difficulty: it.difficulty === "borderline" ? "borderline" : "typical", note: str(it.note) });
+  }
+  return out;
+}
+function coverageOf(specs, items) {
+  const cov = {};
+  for (const s of specs) {
+    cov[s.id] = Object.fromEntries(s.options.map((o) => [o.label, 0]));
+    for (const it of items) {
+      const label = it.labels[s.id];
+      if (label && label in cov[s.id]) cov[s.id][label]++;
+    }
+  }
+  return cov;
+}
+function missingOptions(specs, items) {
+  const cov = coverageOf(specs, items);
+  const missing = [];
+  for (const s of specs) for (const o of s.options) if (!cov[s.id][o.label]) missing.push(`${s.name}: ${o.label}`);
+  return missing;
 }
 
 // src/backends/live.ts
@@ -601,8 +816,103 @@ var liveBackend = {
     }
     if (!out.length) throw new Error("The model did not propose any usable alternatives");
     return out;
+  },
+  async designDataset(description, questionCount) {
+    const res = await chatJSON(
+      [
+        { role: "system", content: DESIGN_SYSTEM.replace("{Q}", String(questionCount)) },
+        { role: "user", content: `Dataset description:
+${description}
+
+Design exactly ${questionCount} questions.` }
+      ],
+      DESIGN_SCHEMA,
+      { model: settings.questionModel, fallbacks: QUESTION_FALLBACK_LLMS, reasoning: "medium", maxTokens: 5e3, temperature: 0.5 }
+    );
+    return normalizeDesign(res, questionCount);
+  },
+  async writeDatasetItems(design, count, focus) {
+    const payload = {
+      dataset: { title: design.title, summary: design.summary },
+      setting: design.setting,
+      questions: design.specs.map((s) => ({ name: s.name, question: s.question, kind: s.kind ?? "category", options: s.options.map((o) => ({ label: o.label, description: o.description })) })),
+      count,
+      ...focus?.length ? {
+        focus: {
+          instruction: "These options currently have no example. Write only messages whose intended labels include them; each listed option must be the intended answer for at least one message.",
+          options: focus
+        }
+      } : {}
+    };
+    const res = await chatJSON(
+      [
+        { role: "system", content: ITEMS_SYSTEM },
+        { role: "user", content: `Write ${count} messages.
+
+${JSON.stringify(payload, null, 1)}` }
+      ],
+      ITEMS_SCHEMA,
+      { model: settings.questionModel, fallbacks: QUESTION_FALLBACK_LLMS, reasoning: "medium", maxTokens: 12e3, temperature: 0.9 }
+    );
+    const items = normalizeItems(res, design.specs);
+    if (!items.length) throw new Error("The model did not write any usable messages");
+    return items;
   }
 };
+
+// src/backends/mockDataset.ts
+var opts = (labels) => labels.map((label) => ({ label, description: label }));
+function mockDesign(questionCount) {
+  return normalizeDesign(
+    {
+      title: "Shoe store support",
+      summary: "Chat messages from customers of an online shoe store.",
+      setting: { speaker: "customer", recipient: "support team", channel: "website chat", decision: "which queue and how fast to answer" },
+      questions: [
+        { name: "Issue Type", question: "What is the customer\u2019s main issue?", kind: "category", options: opts(["delivery", "returns & refunds", "product defect", "sizing & fit", "payment & billing", "other"]) },
+        { name: "Order Status", question: "What order status does the customer report?", kind: "category", options: opts(["not shipped", "in transit", "delayed", "delivered", "not mentioned"]) },
+        { name: "Sentiment", question: "How does the customer feel?", kind: "scale", options: opts(["very negative", "negative", "neutral", "positive", "very positive"]) },
+        { name: "Urgency", question: "How urgently does this need a reply?", kind: "scale", options: opts(["low", "normal", "high", "critical"]) },
+        { name: "Churn Risk", question: "How likely is the customer to stop buying?", kind: "scale", options: opts(["low", "medium", "high"]) }
+      ]
+    },
+    questionCount
+  );
+}
+var ROWS = [
+  ["My order #48213 is really late and nobody answers my emails.", "delivery", "delayed", "very negative", "high", "high", false],
+  ["Tracking says delivered but the box never arrived, pretty annoying.", "delivery", "delivered", "negative", "high", "medium", false],
+  ["Just wanted to say the boots arrived fast and fit great, thanks!", "other", "delivered", "very positive", "low", "low", false],
+  ["The left sole came apart after two days. Honestly disappointed.", "product defect", "delivered", "negative", "normal", "medium", false],
+  ["can i return the sneakers if i already wore them once? they feel a bit tight", "returns & refunds", "delivered", "neutral", "normal", "low", true],
+  ["Size 42 runs small, could you swap them for a 43 please?", "sizing & fit", "delivered", "neutral", "normal", "low", false],
+  ["I was charged twice for order #51107. Please fix this urgently.", "payment & billing", "not mentioned", "negative", "critical", "medium", false],
+  ["Still waiting for my refund after three weeks. This is ridiculous.", "returns & refunds", "not mentioned", "very negative", "high", "high", false],
+  ["My order hasn\u2019t shipped yet but I need the shoes for a wedding on Saturday!", "delivery", "not shipped", "negative", "critical", "medium", false],
+  ["Package is in transit, just curious about the rough delivery date.", "delivery", "in transit", "neutral", "low", "low", false],
+  ["Love the new loafers, slightly narrow though. Do you have wide sizes?", "sizing & fit", "delivered", "positive", "low", "low", true],
+  ["The zipper broke immediately, really poor quality for that price.", "product defect", "delivered", "very negative", "normal", "high", false],
+  ["Payment keeps failing at checkout with my card, kind of frustrating.", "payment & billing", "not mentioned", "negative", "high", "medium", false],
+  ["Quick question: do you ship to Norway?", "other", "not mentioned", "neutral", "low", "low", false],
+  ["Return label worked perfectly, great service as always.", "returns & refunds", "not mentioned", "very positive", "low", "low", false],
+  ["Order #60021 has been stuck in transit for ten days, getting worried.", "delivery", "delayed", "negative", "high", "medium", true],
+  ["These runners are amazing but half a size too big. Exchange?", "sizing & fit", "delivered", "positive", "normal", "low", false],
+  ["Your courier left my parcel in the rain. Shoes are soaked and ruined.", "product defect", "delivered", "very negative", "high", "high", true],
+  ["Never shopping here again, worst experience ever.", "other", "not mentioned", "very negative", "normal", "high", true],
+  ["Could you tell me when the sandals will ship? No rush.", "delivery", "not shipped", "neutral", "low", "low", false]
+];
+function mockItems(design, count) {
+  const names = ["Issue Type", "Order Status", "Sentiment", "Urgency", "Churn Risk"];
+  const raw = {
+    items: ROWS.slice(0, count).map((r) => ({
+      text: r[0],
+      labels: r.slice(1, 6).map((label, i) => ({ question: names[i], label: String(label) })),
+      difficulty: r[6] ? "borderline" : "typical",
+      note: r[6] ? "Could reasonably be read two ways." : ""
+    }))
+  };
+  return normalizeItems(raw, design.specs);
+}
 
 // src/backends/mock.ts
 var EVALUATIVE_SCALES = [
@@ -684,6 +994,14 @@ var mockBackend = {
       }
     ]);
   },
+  async designDataset(_description, questionCount) {
+    await sleep(900);
+    return mockDesign(questionCount);
+  },
+  async writeDatasetItems(design, count) {
+    await sleep(1200);
+    return mockItems(design, count);
+  },
   async classifyMany(sentences, specs) {
     return Promise.all(sentences.map((sentence) => this.classify(sentence, specs)));
   },
@@ -725,6 +1043,323 @@ var icons = {
   moon: svg('<path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/>'),
   system: svg('<rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8"/><path d="M12 16v4"/>'),
   enter: svg('<path d="M9 10 4 15l5 5"/><path d="M20 4v7a4 4 0 0 1-4 4H4"/>')
+};
+
+// src/ui/toast.ts
+var el = h("div", { class: "toast", attrs: { role: "status" } });
+var timer;
+function mountToast() {
+  document.body.append(el);
+}
+function toast(message, ms = 4200) {
+  el.textContent = message;
+  el.classList.add("show");
+  window.clearTimeout(timer);
+  timer = window.setTimeout(() => el.classList.remove("show"), ms);
+}
+
+// src/dataset/generate.ts
+var MAX_EXTRA = 8;
+async function generateDataset(backend, opts2) {
+  opts2.onStage?.("design");
+  const design = await backend.designDataset(opts2.description, opts2.questionCount);
+  opts2.onStage?.("write", `${design.specs.length} questions`);
+  let items = await backend.writeDatasetItems(design, opts2.count);
+  const missing = missingOptions(design.specs, items);
+  if (missing.length) {
+    opts2.onStage?.("fill", `${missing.length} option${missing.length > 1 ? "s" : ""} without an example`);
+    try {
+      const extra = await backend.writeDatasetItems(design, Math.min(MAX_EXTRA, Math.max(2, Math.ceil(missing.length / 2))), missing);
+      const known = new Set(items.map((i) => i.text.toLowerCase()));
+      items = [...items, ...extra.filter((i) => !known.has(i.text.toLowerCase()))];
+    } catch {
+    }
+  }
+  opts2.onStage?.("done");
+  return { ...design, id: uid(), description: opts2.description, items, createdAt: Date.now() };
+}
+async function regenerateItems(backend, dataset, count, onStage) {
+  onStage?.("write", `${dataset.specs.length} questions`);
+  let items = await backend.writeDatasetItems(dataset, count);
+  const missing = missingOptions(dataset.specs, items);
+  if (missing.length) {
+    onStage?.("fill", `${missing.length} option${missing.length > 1 ? "s" : ""} without an example`);
+    try {
+      const extra = await backend.writeDatasetItems(dataset, Math.min(MAX_EXTRA, Math.max(2, Math.ceil(missing.length / 2))), missing);
+      const known = new Set(items.map((i) => i.text.toLowerCase()));
+      items = [...items, ...extra.filter((i) => !known.has(i.text.toLowerCase()))];
+    } catch {
+    }
+  }
+  onStage?.("done");
+  return { ...dataset, items, createdAt: Date.now() };
+}
+
+// src/dataset/store.ts
+var KEY = "datasets";
+var LIMIT = 12;
+var datasetStore = {
+  list() {
+    return storage.getJSON(KEY, []);
+  },
+  save(dataset) {
+    const rest = this.list().filter((d) => d.id !== dataset.id);
+    storage.setJSON(KEY, [dataset, ...rest].slice(0, LIMIT));
+  },
+  remove(id) {
+    storage.setJSON(
+      KEY,
+      this.list().filter((d) => d.id !== id)
+    );
+  },
+  get(id) {
+    return this.list().find((d) => d.id === id);
+  }
+};
+
+// src/dataset/DatasetPage.ts
+var STAGES = [
+  { stage: "design", label: "Designing questions" },
+  { stage: "write", label: "Writing sentences" },
+  { stage: "fill", label: "Filling coverage gaps" }
+];
+var COUNTS = [10, 20, 30];
+var QUESTION_COUNTS = [3, 4, 5];
+function select(id, values, initial) {
+  const el2 = h("select", { attrs: { id } }, ...values.map((v) => h("option", { text: String(v), attrs: { value: String(v) } })));
+  el2.value = String(initial);
+  return el2;
+}
+var DatasetPage = class {
+  constructor(deps) {
+    this.deps = deps;
+    const presets = h(
+      "div",
+      { class: "chips" },
+      ...DATASET_PRESETS.map(
+        (p) => h("button", {
+          class: "chip",
+          text: p.name,
+          on: {
+            click: () => {
+              this.desc.value = p.description;
+              this.desc.focus();
+            }
+          }
+        })
+      )
+    );
+    this.goBtn.addEventListener("click", () => void this.generate());
+    this.desc.addEventListener("keydown", (ev) => {
+      if (ev.key === "Enter" && (ev.metaKey || ev.ctrlKey)) {
+        ev.preventDefault();
+        void this.generate();
+      }
+    });
+    const form = h(
+      "div",
+      { class: "ds-form" },
+      presets,
+      this.desc,
+      h(
+        "div",
+        { class: "ds-row" },
+        h("label", { class: "ds-opt", attrs: { for: "ds-count" } }, "Sentences", this.countSel),
+        h("label", { class: "ds-opt", attrs: { for: "ds-questions" } }, "Questions", this.qSel),
+        h("span", { class: "grow" }),
+        this.goBtn
+      )
+    );
+    this.el.append(form, this.progress, this.result, this.history);
+    this.renderProgress();
+    const last = datasetStore.list()[0];
+    if (last) this.show(last);
+    this.renderHistory();
+  }
+  el = h("section", { class: "dataset-page" });
+  desc = h("textarea", {
+    class: "ds-desc",
+    attrs: { id: "ds-desc", rows: "4", spellcheck: "true", placeholder: "Who writes these messages, to whom, about what, and what the reader has to decide\u2026", "aria-label": "Dataset description" }
+  });
+  countSel = select("ds-count", COUNTS, 20);
+  qSel = select("ds-questions", QUESTION_COUNTS, 4);
+  goBtn = h("button", { class: "btn primary", text: "Generate" });
+  progress = h("ol", { class: "ds-progress" });
+  result = h("div", { class: "ds-result" });
+  history = h("div", { class: "ds-history" });
+  current = null;
+  busy = false;
+  stage = null;
+  stageDetail = "";
+  async generate() {
+    const description = this.desc.value.trim();
+    if (this.busy) return;
+    if (description.length < 12) {
+      toast("Describe the dataset in a sentence or two first.");
+      this.desc.focus();
+      return;
+    }
+    this.setBusy(true);
+    try {
+      const dataset = await generateDataset(this.deps.backend(), {
+        description,
+        count: Number(this.countSel.value),
+        questionCount: Number(this.qSel.value),
+        onStage: (stage, detail) => this.setStage(stage, detail)
+      });
+      datasetStore.save(dataset);
+      this.show(dataset);
+      this.renderHistory();
+    } catch (err) {
+      toast(errorMessage(err));
+      this.setStage(null);
+    } finally {
+      this.setBusy(false);
+    }
+  }
+  async regenerate() {
+    const ds = this.current;
+    if (!ds || this.busy) return;
+    this.setBusy(true);
+    try {
+      const next = await regenerateItems(this.deps.backend(), ds, Number(this.countSel.value), (stage, detail) => this.setStage(stage, detail));
+      datasetStore.save(next);
+      this.show(next);
+      this.renderHistory();
+    } catch (err) {
+      toast(errorMessage(err));
+      this.setStage(null);
+    } finally {
+      this.setBusy(false);
+    }
+  }
+  setBusy(busy) {
+    this.busy = busy;
+    this.goBtn.disabled = busy;
+    this.goBtn.textContent = busy ? "Generating\u2026" : "Generate";
+    this.el.classList.toggle("busy", busy);
+  }
+  setStage(stage, detail = "") {
+    this.stage = stage;
+    this.stageDetail = detail;
+    this.renderProgress();
+  }
+  renderProgress() {
+    const order = ["design", "write", "fill", "done"];
+    const at = this.stage ? order.indexOf(this.stage) : -1;
+    this.progress.hidden = this.stage === null;
+    this.progress.replaceChildren(
+      ...STAGES.map((s) => {
+        const i = order.indexOf(s.stage);
+        const state = at > i || this.stage === "done" ? "done" : at === i ? "active" : "todo";
+        return h("li", { class: state }, h("span", { class: "dot" }), h("span", { text: s.label }), state === "active" && this.stageDetail ? h("span", { class: "detail", text: this.stageDetail }) : null);
+      })
+    );
+  }
+  show(ds) {
+    this.current = ds;
+    this.desc.value = ds.description;
+    const cov = coverageOf(ds.specs, ds.items);
+    const setting = [ds.setting.speaker && `${ds.setting.speaker} \u2192 ${ds.setting.recipient}`, ds.setting.channel, ds.setting.decision && `decides ${ds.setting.decision}`].filter(Boolean).join(" \xB7 ");
+    const borderline = ds.items.filter((i) => i.difficulty === "borderline").length;
+    const gaps = ds.specs.reduce((n, s) => n + s.options.filter((o) => !cov[s.id][o.label]).length, 0);
+    const head = h(
+      "div",
+      { class: "ds-head" },
+      h("div", { class: "ds-title" }, h("h2", { text: ds.title }), ds.summary ? h("p", { text: ds.summary }) : null, setting ? h("p", { class: "ds-setting", text: setting }) : null),
+      h(
+        "div",
+        { class: "ds-actions" },
+        h("button", { class: "btn primary", text: "Open in playground", attrs: { title: "Replace the playground cards with these sentences" }, on: { click: () => this.deps.onOpen(ds, "replace") } }),
+        h("button", { class: "btn", text: "Add to playground", on: { click: () => this.deps.onOpen(ds, "append") } }),
+        h("button", { class: "btn ghost", text: "New sentences", attrs: { title: "Keep the questions, write new sentences" }, on: { click: () => void this.regenerate() } })
+      )
+    );
+    const stats = h(
+      "div",
+      { class: "ds-stats" },
+      h("span", {}, h("b", { text: String(ds.items.length) }), " sentences"),
+      h("span", {}, h("b", { text: String(ds.specs.length) }), " questions"),
+      h("span", {}, h("b", { text: String(borderline) }), " borderline"),
+      h("span", { class: gaps ? "bad" : "good" }, h("b", { text: String(gaps) }), gaps === 1 ? " option without an example" : " options without an example")
+    );
+    const questions = h("div", { class: "ds-questions" }, ...ds.specs.map((s) => this.renderQuestion(s, cov[s.id])));
+    const rows = ds.items.map((item, n) => {
+      const labels = h("div", { class: "ds-labels" }, ...ds.specs.map((s) => item.labels[s.id] ? h("span", { class: "ds-label", attrs: { title: s.name } }, h("i", { text: s.name }), item.labels[s.id]) : null));
+      const remove = h("button", { class: "icon-btn sm", html: icons.close, attrs: { title: "Remove sentence", "aria-label": "Remove sentence" } });
+      remove.addEventListener("click", () => {
+        const next = { ...ds, items: ds.items.filter((i) => i.id !== item.id) };
+        datasetStore.save(next);
+        this.show(next);
+        this.renderHistory();
+      });
+      return h(
+        "li",
+        { class: `ds-item${item.difficulty === "borderline" ? " borderline" : ""}` },
+        h("span", { class: "ds-n", text: String(n + 1) }),
+        h(
+          "div",
+          { class: "ds-body" },
+          h("p", { class: "ds-text", text: item.text }),
+          labels,
+          item.difficulty === "borderline" ? h("p", { class: "ds-note" }, h("span", { class: "pill warn", text: "borderline" }), item.note) : null
+        ),
+        remove
+      );
+    });
+    this.result.replaceChildren(head, stats, questions, h("ol", { class: "ds-items" }, ...rows));
+  }
+  renderQuestion(spec, counts) {
+    const max = Math.max(1, ...Object.values(counts));
+    return h(
+      "section",
+      { class: "ds-q" },
+      h("h3", { attrs: { title: spec.question } }, spec.name, spec.kind ? h("span", { class: "pill", text: spec.kind }) : null),
+      h(
+        "div",
+        { class: "ds-cov" },
+        ...spec.options.map((o) => {
+          const n = counts[o.label] ?? 0;
+          return h(
+            "div",
+            { class: `ds-cov-row${n ? "" : " empty"}`, attrs: { title: o.description } },
+            h("span", { class: "l", text: o.label }),
+            h("div", { class: "track" }, h("div", { class: "fill", style: { width: `${n / max * 100}%` } })),
+            h("span", { class: "v", text: String(n) })
+          );
+        })
+      )
+    );
+  }
+  renderHistory() {
+    const list = datasetStore.list();
+    this.history.hidden = !list.length;
+    this.history.replaceChildren(
+      h("h3", { text: "Saved datasets" }),
+      h(
+        "ul",
+        {},
+        ...list.map((ds) => {
+          const open = h("button", { class: "ds-hist-open" }, h("span", { class: "t", text: ds.title }), h("span", { class: "m", text: `${ds.items.length} sentences \xB7 ${new Date(ds.createdAt).toLocaleDateString(void 0, { month: "short", day: "numeric" })}` }));
+          open.addEventListener("click", () => {
+            this.setStage(null);
+            this.show(ds);
+            window.scrollTo({ top: 0, behavior: "smooth" });
+          });
+          const del = h("button", { class: "icon-btn sm", html: icons.close, attrs: { title: "Delete dataset", "aria-label": `Delete ${ds.title}` } });
+          del.addEventListener("click", () => {
+            datasetStore.remove(ds.id);
+            if (this.current?.id === ds.id) {
+              this.current = null;
+              this.result.replaceChildren();
+            }
+            this.renderHistory();
+          });
+          return h("li", { class: this.current?.id === ds.id ? "on" : "" }, open, del);
+        })
+      )
+    );
+  }
 };
 
 // src/ui/Composer.ts
@@ -769,6 +1404,10 @@ function applyTheme(mode) {
 var nextTheme = (mode) => THEME_ORDER[(THEME_ORDER.indexOf(mode) + 1) % THEME_ORDER.length];
 
 // src/ui/Header.ts
+var ROUTES = [
+  { route: "playground", label: "Playground", hash: "#/" },
+  { route: "dataset", label: "Dataset", hash: "#/dataset" }
+];
 var THEME_ICON = { system: icons.system, light: icons.sun, dark: icons.moon };
 var THEME_LABEL = { system: "Theme: system", light: "Theme: light", dark: "Theme: dark" };
 var Header = class {
@@ -776,24 +1415,40 @@ var Header = class {
   themeBtn;
   soundBtn;
   modePill;
+  tabs = /* @__PURE__ */ new Map();
   constructor(onOpenSettings) {
     this.themeBtn = h("button", { class: "icon-btn", on: { click: () => updateSettings({ theme: nextTheme(settings.theme) }) } });
     this.soundBtn = h("button", { class: "icon-btn", on: { click: () => updateSettings({ sound: !settings.sound }) } });
-    const gear = h("button", { class: "icon-btn", html: icons.settings, attrs: { title: "Settings", "aria-label": "Settings" }, on: { click: onOpenSettings } });
     this.modePill = h("span", { class: "pill", text: "demo" });
+    const gear = h("button", { class: "icon-btn", html: icons.settings, attrs: { title: "Settings", "aria-label": "Settings" }, on: { click: onOpenSettings } });
     this.el = h(
       "header",
       { class: "topbar" },
       h("div", { class: "brand" }, h("h1", { text: "Word Dial" }), this.modePill),
+      h(
+        "nav",
+        { class: "tabs" },
+        ...ROUTES.map((r) => {
+          const a = h("a", { text: r.label, attrs: { href: r.hash } });
+          this.tabs.set(r.route, a);
+          return a;
+        })
+      ),
       h("div", { class: "tools" }, this.themeBtn, this.soundBtn, gear)
     );
     this.sync();
     settingsEvents.on("change", () => this.sync());
   }
+  setRoute(route) {
+    for (const [r, a] of this.tabs) {
+      a.classList.toggle("on", r === route);
+      if (r === route) a.setAttribute("aria-current", "page");
+      else a.removeAttribute("aria-current");
+    }
+  }
   sync() {
     this.themeBtn.innerHTML = THEME_ICON[settings.theme];
     this.themeBtn.title = THEME_LABEL[settings.theme];
-    this.themeBtn.setAttribute("aria-label", THEME_LABEL[settings.theme]);
     this.soundBtn.innerHTML = settings.sound ? icons.soundOn : icons.soundOff;
     this.soundBtn.title = settings.sound ? "Sound on" : "Sound off";
     this.soundBtn.classList.toggle("off", !settings.sound);
@@ -828,9 +1483,10 @@ function inlineInput(initial, onCommit, placeholder = "") {
   return input;
 }
 var Histogram = class {
-  constructor(spec, edit = null) {
+  constructor(spec, edit = null, expected) {
     this.spec = spec;
     this.edit = edit;
+    this.expected = expected;
     this.render();
   }
   el = h("section", { class: "hist" });
@@ -919,7 +1575,8 @@ var Histogram = class {
       remove.addEventListener("click", () => this.remove(label));
       parts.push(remove);
     }
-    const root = h("div", { class: "hrow" }, ...parts);
+    const root = h("div", { class: `hrow${label === this.expected ? " expected" : ""}` }, ...parts);
+    if (label === this.expected) labelEl.title = `Intended label in the dataset${description ? ` \u2014 ${description}` : ""}`;
     this.rows.set(label, { root, fill, ghost, pct, delta });
     return root;
   }
@@ -941,8 +1598,8 @@ var ClassificationPanel = class {
     const block = () => h("section", { class: "hist skeleton" }, h("h3"), h("div", { class: "hrows" }, ...Array.from({ length: 4 }, () => h("div", { class: "hrow" }, h("div", { class: "track" })))));
     this.el.replaceChildren(...Array.from({ length: QUESTION_COUNT }, block));
   }
-  setSpecs(specs, onEdit) {
-    this.histograms = specs.map((spec) => new Histogram(spec, onEdit ?? null));
+  setSpecs(specs, onEdit, expected) {
+    this.histograms = specs.map((spec) => new Histogram(spec, onEdit ?? null, expected?.[spec.id]));
     this.el.replaceChildren(...this.histograms.map((x) => x.el));
     this.el.classList.add("pending");
   }
@@ -1256,14 +1913,14 @@ var DialSentence = class {
     const pending = this.inflight.get(key2);
     if (pending) return pending;
     const current = rungOf(t, from).text;
-    const request = {
+    const request2 = {
       marked: this.tokens.map((x) => x === t ? `\u27E6${current}\u27E7` : x.text).join(""),
       current,
       ladder: [...t.ladder.entries()].sort((a, b) => a[0] - b[0]).map(([, r]) => r.text),
       kind: t.kind ?? "evaluative",
       dir
     };
-    const promise = this.backend().nextRung(request).then((res) => {
+    const promise = this.backend().nextRung(request2).then((res) => {
       this.inflight.delete(key2);
       if (!this.alive(t)) return null;
       const text = this.matchCase(t, res.replacement);
@@ -1559,19 +2216,6 @@ function installDialInteractions() {
   addEventListener("resize", () => ladder.reposition());
 }
 
-// src/ui/toast.ts
-var el = h("div", { class: "toast", attrs: { role: "status" } });
-var timer;
-function mountToast() {
-  document.body.append(el);
-}
-function toast(message, ms = 4200) {
-  el.textContent = message;
-  el.classList.add("show");
-  window.clearTimeout(timer);
-  timer = window.setTimeout(() => el.classList.remove("show"), ms);
-}
-
 // src/ui/SentenceCard.ts
 var SentenceCard = class {
   constructor(record, deps) {
@@ -1585,7 +2229,14 @@ var SentenceCard = class {
       h("button", { class: "icon-btn sm", html: icons.reset, attrs: { title: "Reset to original", "aria-label": "Reset" }, on: { click: () => this.resetToOriginal() } }),
       h("button", { class: "icon-btn sm", html: icons.close, attrs: { title: "Remove", "aria-label": "Remove" }, on: { click: () => this.deps.onRemove(this) } })
     );
-    this.el = h("article", { class: "card" }, actions, this.dial.el, this.statusEl, this.panel.el);
+    const src = record.source;
+    const meta = src ? h(
+      "div",
+      { class: "card-meta" },
+      h("span", { text: src.dataset }),
+      src.difficulty === "borderline" ? h("span", { class: "pill warn", text: "borderline", attrs: { title: src.note || "Could reasonably be labelled two ways" } }) : null
+    ) : null;
+    this.el = h("article", { class: "card" }, actions, meta, this.dial.el, this.statusEl, this.panel.el);
     this.unsubscribe.push(
       attachDial(this.dial),
       this.dial.events.on("change", ({ text }) => {
@@ -1651,7 +2302,7 @@ var SentenceCard = class {
     this.events.clear();
   }
   showSpecs(specs) {
-    this.panel.setSpecs(specs, (next) => this.editSpec(next));
+    this.panel.setSpecs(specs, (next) => this.editSpec(next), this.record.expected);
   }
   editSpec(next) {
     const specs = (this.record.specs ?? []).map((s) => s.id === next.id ? next : s);
@@ -2155,14 +2806,20 @@ var App = class {
   settingsDialog = new SettingsDialog();
   composer = new Composer((text) => this.add(text));
   shell = h("div", { class: "shell" });
+  playground = h("div", { class: "page" });
+  datasetPage = new DatasetPage({ backend: currentBackend, onOpen: (ds, mode) => this.openDataset(ds, mode) });
+  header;
   swap = new SwapPanel({
     backend: currentBackend,
     onVisibilityChange: (open) => this.shell.classList.toggle("with-swap", open)
   });
   constructor(root) {
-    const header = new Header(() => this.openSettings());
-    this.shell.append(h("div", { class: "wrap" }, header.el, this.composer.el, this.list), this.swap.el);
+    this.header = new Header(() => this.openSettings());
+    this.playground.append(this.composer.el, this.list);
+    this.shell.append(h("div", { class: "wrap" }, this.header.el, this.playground, this.datasetPage.el), this.swap.el);
     root.append(this.shell);
+    addEventListener("hashchange", () => this.route());
+    this.route();
     document.addEventListener("keydown", (ev) => {
       if (ev.key === "Escape" && !this.swap.el.hidden && !(ev.target instanceof HTMLInputElement) && !(ev.target instanceof HTMLTextAreaElement)) this.swap.close();
     });
@@ -2178,7 +2835,35 @@ var App = class {
     const stored = storage.getJSON(STORE_KEY, []);
     if (stored.length) for (const record of [...stored].reverse()) this.mount(record, false);
     else this.add(SEED_SENTENCE);
-    this.composer.focus();
+    if (!this.playground.hidden) this.composer.focus();
+  }
+  route() {
+    const route = location.hash.startsWith("#/dataset") ? "dataset" : "playground";
+    this.header.setRoute(route);
+    this.playground.hidden = route !== "playground";
+    this.datasetPage.el.hidden = route !== "dataset";
+    if (route !== "playground") this.swap.close();
+    else this.composer.focus();
+  }
+  openDataset(ds, mode) {
+    if (mode === "replace") for (const card of [...this.cards]) this.remove(card, false);
+    for (const item of [...ds.items].reverse()) {
+      this.mount(
+        {
+          id: uid(),
+          original: item.text,
+          text: item.text,
+          specs: ds.specs.map((s) => ({ ...s, options: s.options.map((o) => ({ ...o })) })),
+          baseline: null,
+          expected: item.labels,
+          source: { dataset: ds.title, difficulty: item.difficulty, note: item.note }
+        },
+        false
+      );
+    }
+    this.persist();
+    location.hash = "#/";
+    window.scrollTo({ top: 0 });
   }
   openSettings() {
     this.settingsDialog.open();
@@ -2199,7 +2884,7 @@ var App = class {
     if (animate) card.el.classList.add("enter");
     void card.start();
   }
-  remove(card) {
+  remove(card, animate = true) {
     const i = this.cards.indexOf(card);
     if (i < 0) return;
     this.cards.splice(i, 1);
@@ -2207,6 +2892,10 @@ var App = class {
     card.dispose();
     this.persist();
     const el2 = card.el;
+    if (!animate) {
+      el2.remove();
+      return;
+    }
     el2.style.height = `${el2.offsetHeight}px`;
     void el2.offsetWidth;
     el2.classList.add("leave");

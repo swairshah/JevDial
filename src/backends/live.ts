@@ -17,6 +17,8 @@ import {
 import { chatJSON, hasLlmAccess } from '../services/openrouter';
 import { systemOne, systemOneBatched, type JevQuestions } from '../services/jev';
 import { QUESTION_FALLBACK_LLMS } from '../config';
+import { DESIGN_SCHEMA, DESIGN_SYSTEM, ITEMS_SCHEMA, ITEMS_SYSTEM } from '../dataset/prompts';
+import { normalizeDesign, normalizeItems, type RawDesign, type RawItems } from '../dataset/normalize';
 import { settings } from '../settings';
 import type { Backend, StepResult, SwapKind, SwapOption, WordKind, WordRef, WordTag } from '../types';
 import { errorMessage, num } from '../util';
@@ -193,5 +195,45 @@ export const liveBackend: Backend = {
     }
     if (!out.length) throw new Error('The model did not propose any usable alternatives');
     return out;
+  },
+
+  async designDataset(description, questionCount) {
+    const res = await chatJSON<RawDesign>(
+      [
+        { role: 'system', content: DESIGN_SYSTEM.replace('{Q}', String(questionCount)) },
+        { role: 'user', content: `Dataset description:\n${description}\n\nDesign exactly ${questionCount} questions.` }
+      ],
+      DESIGN_SCHEMA,
+      { model: settings.questionModel, fallbacks: QUESTION_FALLBACK_LLMS, reasoning: 'medium', maxTokens: 5000, temperature: 0.5 }
+    );
+    return normalizeDesign(res, questionCount);
+  },
+
+  async writeDatasetItems(design, count, focus) {
+    const payload = {
+      dataset: { title: design.title, summary: design.summary },
+      setting: design.setting,
+      questions: design.specs.map(s => ({ name: s.name, question: s.question, kind: s.kind ?? 'category', options: s.options.map(o => ({ label: o.label, description: o.description })) })),
+      count,
+      ...(focus?.length
+        ? {
+            focus: {
+              instruction: 'These options currently have no example. Write only messages whose intended labels include them; each listed option must be the intended answer for at least one message.',
+              options: focus
+            }
+          }
+        : {})
+    };
+    const res = await chatJSON<RawItems>(
+      [
+        { role: 'system', content: ITEMS_SYSTEM },
+        { role: 'user', content: `Write ${count} messages.\n\n${JSON.stringify(payload, null, 1)}` }
+      ],
+      ITEMS_SCHEMA,
+      { model: settings.questionModel, fallbacks: QUESTION_FALLBACK_LLMS, reasoning: 'medium', maxTokens: 12000, temperature: 0.9 }
+    );
+    const items = normalizeItems(res, design.specs);
+    if (!items.length) throw new Error('The model did not write any usable messages');
+    return items;
   }
 };

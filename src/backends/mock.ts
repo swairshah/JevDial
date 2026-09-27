@@ -1,6 +1,7 @@
 import { normalizeDistribution, normalizeQuestions } from '../analysis/questions';
 import type { Backend, WordTag } from '../types';
 import { sleep } from '../util';
+import { mockDesign, mockItems } from './mockDataset';
 
 const EVALUATIVE_SCALES = [
   ['abysmal', 'terrible', 'bad', 'poor', 'meh', 'okay', 'fine', 'decent', 'good', 'great', 'excellent', 'amazing', 'phenomenal'],
@@ -87,6 +88,16 @@ export const mockBackend: Backend = {
         options: ['definitely', 'probably', 'unsure', 'unlikely', 'never'].map(label => ({ label, description: label }))
       }
     ]);
+  },
+
+  async designDataset(_description, questionCount) {
+    await sleep(900);
+    return mockDesign(questionCount);
+  },
+
+  async writeDatasetItems(design, count) {
+    await sleep(1200);
+    return mockItems(design, count);
   },
 
   async classifyMany(sentences, specs) {

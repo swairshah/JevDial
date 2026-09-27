@@ -5,11 +5,12 @@ export interface RawQuestion {
   name?: unknown;
   question?: unknown;
   options?: { label?: unknown; description?: unknown }[];
+  kind?: unknown;
 }
 
 const clean = (v: unknown): string => (typeof v === 'string' ? v.trim().replace(/\s+/g, ' ') : '');
 
-export function normalizeQuestions(raw: RawQuestion[] | undefined): QuestionSpec[] {
+export function normalizeQuestions(raw: RawQuestion[] | undefined, max = QUESTION_COUNT): QuestionSpec[] {
   const specs: QuestionSpec[] = [];
   for (const q of raw ?? []) {
     const name = clean(q.name);
@@ -19,8 +20,9 @@ export function normalizeQuestions(raw: RawQuestion[] | undefined): QuestionSpec
       .filter(o => o.label && !seen.has(o.label) && seen.add(o.label))
       .slice(0, 8);
     if (!name || options.length < 2) continue;
-    specs.push({ id: `q${specs.length + 1}`, name, question: clean(q.question) || name, options });
-    if (specs.length === QUESTION_COUNT) break;
+    const kind = q.kind === 'scale' || q.kind === 'category' ? q.kind : undefined;
+    specs.push({ id: `q${specs.length + 1}`, name, question: clean(q.question) || name, options, ...(kind ? { kind } : {}) });
+    if (specs.length === max) break;
   }
   if (!specs.length) throw new Error('The model did not propose any usable questions');
   return specs;

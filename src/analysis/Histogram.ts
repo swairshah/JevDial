@@ -43,7 +43,7 @@ export class Histogram {
   private rows = new Map<string, Row>();
   private last: { dist: Distribution; baseline?: Distribution } | null = null;
 
-  constructor(readonly spec: QuestionSpec, private readonly edit: SpecEditor | null = null) {
+  constructor(readonly spec: QuestionSpec, private readonly edit: SpecEditor | null = null, private readonly expected?: string) {
     this.render();
   }
 
@@ -133,7 +133,8 @@ export class Histogram {
       remove.addEventListener('click', () => this.remove(label));
       parts.push(remove);
     }
-    const root = h('div', { class: 'hrow' }, ...parts);
+    const root = h('div', { class: `hrow${label === this.expected ? ' expected' : ''}` }, ...parts);
+    if (label === this.expected) labelEl.title = `Intended label in the dataset${description ? ` — ${description}` : ''}`;
     this.rows.set(label, { root, fill, ghost, pct, delta });
     return root;
   }

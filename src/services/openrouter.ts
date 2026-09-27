@@ -88,7 +88,7 @@ export function chatJSON<T>(messages: ChatMessage[], schema: object, options: Ch
       if (parsed) return parsed;
       console.warn('Word Dial: unparseable LLM response', data);
       lastError = `finish_reason=${finish}, content=${JSON.stringify(content.slice(0, 80))}`;
-      if (finish === 'length') maxTokens = Math.min(maxTokens * 2, 6000);
+      if (finish === 'length') maxTokens = Math.min(maxTokens * 2, 16000);
     }
     throw new Error(`Model did not return JSON (${lastError.slice(0, 200)})`);
   });

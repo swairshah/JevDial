@@ -1,8 +1,10 @@
 import { currentBackend } from './backends';
 import { SEED_SENTENCE } from './config';
+import { DatasetPage, type OpenMode } from './dataset/DatasetPage';
 import { settings, settingsEvents, storage } from './settings';
+import type { Dataset } from './types';
 import { Composer } from './ui/Composer';
-import { Header } from './ui/Header';
+import { Header, type Route } from './ui/Header';
 import { SentenceCard, type CardRecord } from './ui/SentenceCard';
 import { SettingsDialog } from './ui/SettingsDialog';
 import { SwapPanel } from './ui/SwapPanel';
@@ -17,15 +19,21 @@ export class App {
   private readonly settingsDialog = new SettingsDialog();
   private readonly composer = new Composer(text => this.add(text));
   private readonly shell = h('div', { class: 'shell' });
+  private readonly playground = h('div', { class: 'page' });
+  private readonly datasetPage = new DatasetPage({ backend: currentBackend, onOpen: (ds, mode) => this.openDataset(ds, mode) });
+  private readonly header: Header;
   private readonly swap = new SwapPanel({
     backend: currentBackend,
     onVisibilityChange: open => this.shell.classList.toggle('with-swap', open)
   });
 
   constructor(root: HTMLElement) {
-    const header = new Header(() => this.openSettings());
-    this.shell.append(h('div', { class: 'wrap' }, header.el, this.composer.el, this.list), this.swap.el);
+    this.header = new Header(() => this.openSettings());
+    this.playground.append(this.composer.el, this.list);
+    this.shell.append(h('div', { class: 'wrap' }, this.header.el, this.playground, this.datasetPage.el), this.swap.el);
     root.append(this.shell);
+    addEventListener('hashchange', () => this.route());
+    this.route();
     document.addEventListener('keydown', ev => {
       if (ev.key === 'Escape' && !this.swap.el.hidden && !(ev.target instanceof HTMLInputElement) && !(ev.target instanceof HTMLTextAreaElement)) this.swap.close();
     });
@@ -42,7 +50,37 @@ export class App {
     const stored = storage.getJSON<CardRecord[]>(STORE_KEY, []);
     if (stored.length) for (const record of [...stored].reverse()) this.mount(record, false);
     else this.add(SEED_SENTENCE);
-    this.composer.focus();
+    if (!this.playground.hidden) this.composer.focus();
+  }
+
+  private route(): void {
+    const route: Route = location.hash.startsWith('#/dataset') ? 'dataset' : 'playground';
+    this.header.setRoute(route);
+    this.playground.hidden = route !== 'playground';
+    this.datasetPage.el.hidden = route !== 'dataset';
+    if (route !== 'playground') this.swap.close();
+    else this.composer.focus();
+  }
+
+  private openDataset(ds: Dataset, mode: OpenMode): void {
+    if (mode === 'replace') for (const card of [...this.cards]) this.remove(card, false);
+    for (const item of [...ds.items].reverse()) {
+      this.mount(
+        {
+          id: uid(),
+          original: item.text,
+          text: item.text,
+          specs: ds.specs.map(s => ({ ...s, options: s.options.map(o => ({ ...o })) })),
+          baseline: null,
+          expected: item.labels,
+          source: { dataset: ds.title, difficulty: item.difficulty, note: item.note }
+        },
+        false
+      );
+    }
+    this.persist();
+    location.hash = '#/';
+    window.scrollTo({ top: 0 });
   }
 
   openSettings(): void {
@@ -67,7 +105,7 @@ export class App {
     void card.start();
   }
 
-  private remove(card: SentenceCard): void {
+  private remove(card: SentenceCard, animate = true): void {
     const i = this.cards.indexOf(card);
     if (i < 0) return;
     this.cards.splice(i, 1);
@@ -75,6 +113,10 @@ export class App {
     card.dispose();
     this.persist();
     const el = card.el;
+    if (!animate) {
+      el.remove();
+      return;
+    }
     el.style.height = `${el.offsetHeight}px`;
     void el.offsetWidth;
     el.classList.add('leave');

@@ -51,6 +51,7 @@ export interface QuestionSpec {
   name: string;
   question: string;
   options: QuestionOption[];
+  kind?: 'category' | 'scale';
 }
 
 export type Distribution = Record<string, number>;
@@ -70,6 +71,37 @@ export interface SwapRequest {
   specs: QuestionSpec[];
 }
 
+export interface DatasetSetting {
+  speaker: string;
+  recipient: string;
+  channel: string;
+  decision: string;
+}
+
+export interface DatasetDesign {
+  title: string;
+  summary: string;
+  setting: DatasetSetting;
+  specs: QuestionSpec[];
+}
+
+export type Difficulty = 'typical' | 'borderline';
+
+export interface DatasetItem {
+  id: string;
+  text: string;
+  labels: Record<string, string>;
+  difficulty: Difficulty;
+  note: string;
+}
+
+export interface Dataset extends DatasetDesign {
+  id: string;
+  description: string;
+  items: DatasetItem[];
+  createdAt: number;
+}
+
 export interface Backend {
   readonly id: 'live' | 'mock';
   tagWords(sentence: string, words: WordRef[]): Promise<TagResult>;
@@ -78,4 +110,6 @@ export interface Backend {
   classify(sentence: string, specs: QuestionSpec[]): Promise<Classification>;
   classifyMany(sentences: string[], specs: QuestionSpec[]): Promise<Classification[]>;
   proposeSwaps(request: SwapRequest): Promise<SwapOption[]>;
+  designDataset(description: string, questionCount: number): Promise<DatasetDesign>;
+  writeDatasetItems(design: DatasetDesign, count: number, focus?: string[]): Promise<DatasetItem[]>;
 }
