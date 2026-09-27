@@ -9,6 +9,7 @@ const EVALUATIVE_SCALES = [
   ['hate', 'dislike', 'tolerate', 'like', 'enjoy', 'love', 'adore'],
   ['boring', 'dull', 'fine', 'interesting', 'fascinating', 'riveting']
 ];
+const MOCK_SWAPS = ['need', 'demand', 'would like', 'would appreciate', 'wish', 'require', 'hope', 'expect', 'insist', 'prefer'];
 const DEGREE_SCALE = ['barely', 'slightly', 'somewhat', 'fairly', 'pretty', 'quite', 'very', 'extremely', 'incredibly'];
 
 function locate(word: string): { scale: string[]; i: number; degree: boolean } | null {
@@ -86,6 +87,17 @@ export const mockBackend: Backend = {
         options: ['definitely', 'probably', 'unsure', 'unlikely', 'never'].map(label => ({ label, description: label }))
       }
     ]);
+  },
+
+  async classifyMany(sentences, specs) {
+    return Promise.all(sentences.map(sentence => this.classify(sentence, specs)));
+  },
+
+  async proposeSwaps(req) {
+    await sleep(500);
+    const hit = locate(req.word);
+    const pool = hit ? hit.scale.filter(w => w !== req.word.toLowerCase()) : MOCK_SWAPS;
+    return pool.slice(0, 10).map((text, i) => ({ text, kind: (['synonym', 'stronger', 'weaker', 'opposite', 'formal', 'casual', 'shift'] as const)[i % 7] }));
   },
 
   async classify(sentence, specs) {

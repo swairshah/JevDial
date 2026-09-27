@@ -130,3 +130,33 @@ export const VALENCE_LEVELS = [
 ];
 
 export const DEGREE_LEVELS = ['Weak: barely, slightly, a bit', 'Moderate: somewhat, fairly, pretty', 'Strong: very, really, quite', 'Extreme: extremely, utterly, incredibly'];
+
+export const SWAP_KINDS = ['synonym', 'stronger', 'weaker', 'opposite', 'formal', 'casual', 'shift'] as const;
+
+export const SWAP_SYSTEM = `You help probe a text classifier. You receive a sentence with one span wrapped in ⟦ ⟧ and the questions the classifier answers about the sentence.
+Propose 12 replacements for the span. Each must drop into the sentence exactly where the span is, with nothing else changed, and read naturally (keep the grammatical role and inflection; 1 to 4 words; no punctuation).
+Cover a spread of kinds:
+- synonym: near-identical meaning
+- stronger / weaker: same meaning, more or less intense
+- opposite: reverses the meaning or stance
+- formal / casual: same meaning, different register
+- shift: changes what the sentence is about or asks for (e.g. "fixed" → "removed", "refunded", "redesigned")
+Include some you expect to flip the classifier's answers and some you expect to leave them unchanged. Never repeat the original span.
+Reply with JSON only: {"alternatives":[{"text":string,"kind":"synonym"|"stronger"|"weaker"|"opposite"|"formal"|"casual"|"shift"}]}`;
+
+export const SWAP_SCHEMA = {
+  type: 'object',
+  properties: {
+    alternatives: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: { text: { type: 'string' }, kind: { type: 'string', enum: [...SWAP_KINDS] } },
+        required: ['text', 'kind'],
+        additionalProperties: false
+      }
+    }
+  },
+  required: ['alternatives'],
+  additionalProperties: false
+};

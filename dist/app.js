@@ -318,6 +318,33 @@ var VALENCE_LEVELS = [
   "Strongly positive: amazing, love, perfect, thrilled"
 ];
 var DEGREE_LEVELS = ["Weak: barely, slightly, a bit", "Moderate: somewhat, fairly, pretty", "Strong: very, really, quite", "Extreme: extremely, utterly, incredibly"];
+var SWAP_KINDS = ["synonym", "stronger", "weaker", "opposite", "formal", "casual", "shift"];
+var SWAP_SYSTEM = `You help probe a text classifier. You receive a sentence with one span wrapped in \u27E6 \u27E7 and the questions the classifier answers about the sentence.
+Propose 12 replacements for the span. Each must drop into the sentence exactly where the span is, with nothing else changed, and read naturally (keep the grammatical role and inflection; 1 to 4 words; no punctuation).
+Cover a spread of kinds:
+- synonym: near-identical meaning
+- stronger / weaker: same meaning, more or less intense
+- opposite: reverses the meaning or stance
+- formal / casual: same meaning, different register
+- shift: changes what the sentence is about or asks for (e.g. "fixed" \u2192 "removed", "refunded", "redesigned")
+Include some you expect to flip the classifier's answers and some you expect to leave them unchanged. Never repeat the original span.
+Reply with JSON only: {"alternatives":[{"text":string,"kind":"synonym"|"stronger"|"weaker"|"opposite"|"formal"|"casual"|"shift"}]}`;
+var SWAP_SCHEMA = {
+  type: "object",
+  properties: {
+    alternatives: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: { text: { type: "string" }, kind: { type: "string", enum: [...SWAP_KINDS] } },
+        required: ["text", "kind"],
+        additionalProperties: false
+      }
+    }
+  },
+  required: ["alternatives"],
+  additionalProperties: false
+};
 
 // src/services/proxy.ts
 var proxy = {
@@ -549,6 +576,31 @@ var liveBackend = {
         return [spec.id, normalizeDistribution(spec, a?.type === "choice" ? a.probabilities : a?.type === "score" ? a.probabilities : void 0)];
       })
     );
+  },
+  async classifyMany(sentences, specs) {
+    return Promise.all(sentences.map((sentence) => this.classify(sentence, specs)));
+  },
+  async proposeSwaps(req) {
+    const questions = req.specs.map((s) => ({ name: s.name, question: s.question, options: s.options.map((o) => o.label) }));
+    const res = await chatJSON(
+      [
+        { role: "system", content: SWAP_SYSTEM },
+        { role: "user", content: JSON.stringify({ sentence: req.marked, span: req.word, classifier_questions: questions }, null, 1) }
+      ],
+      SWAP_SCHEMA,
+      { maxTokens: 2500, temperature: 0.8 }
+    );
+    const seen = /* @__PURE__ */ new Set([req.word.toLowerCase()]);
+    const out = [];
+    for (const alt of res.alternatives ?? []) {
+      const text = String(alt.text ?? "").trim().replace(/^["'“”]+|["'“”.,;:!?]+$/g, "");
+      if (!text || seen.has(text.toLowerCase()) || text.split(/\s+/).length > 5) continue;
+      seen.add(text.toLowerCase());
+      const kind = SWAP_KINDS.includes(alt.kind ?? "") ? alt.kind : "synonym";
+      out.push({ text, kind });
+    }
+    if (!out.length) throw new Error("The model did not propose any usable alternatives");
+    return out;
   }
 };
 
@@ -560,6 +612,7 @@ var EVALUATIVE_SCALES = [
   ["hate", "dislike", "tolerate", "like", "enjoy", "love", "adore"],
   ["boring", "dull", "fine", "interesting", "fascinating", "riveting"]
 ];
+var MOCK_SWAPS = ["need", "demand", "would like", "would appreciate", "wish", "require", "hope", "expect", "insist", "prefer"];
 var DEGREE_SCALE = ["barely", "slightly", "somewhat", "fairly", "pretty", "quite", "very", "extremely", "incredibly"];
 function locate(word) {
   const w = word.toLowerCase();
@@ -630,6 +683,15 @@ var mockBackend = {
         options: ["definitely", "probably", "unsure", "unlikely", "never"].map((label) => ({ label, description: label }))
       }
     ]);
+  },
+  async classifyMany(sentences, specs) {
+    return Promise.all(sentences.map((sentence) => this.classify(sentence, specs)));
+  },
+  async proposeSwaps(req) {
+    await sleep(500);
+    const hit = locate(req.word);
+    const pool = hit ? hit.scale.filter((w) => w !== req.word.toLowerCase()) : MOCK_SWAPS;
+    return pool.slice(0, 10).map((text, i) => ({ text, kind: ["synonym", "stronger", "weaker", "opposite", "formal", "casual", "shift"][i % 7] }));
   },
   async classify(sentence, specs) {
     await sleep(250 + Math.random() * 200);
@@ -740,30 +802,42 @@ var Header = class {
 };
 
 // src/analysis/Histogram.ts
+function inlineInput(initial, onCommit, placeholder = "") {
+  const input = h("input", { class: "inline-edit", attrs: { type: "text", value: initial, placeholder, spellcheck: "false" } });
+  input.value = initial;
+  let done = false;
+  const finish = (value) => {
+    if (done) return;
+    done = true;
+    onCommit(value);
+  };
+  input.addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter") {
+      ev.preventDefault();
+      finish(input.value.trim());
+    } else if (ev.key === "Escape") {
+      ev.preventDefault();
+      finish(null);
+    }
+  });
+  input.addEventListener("blur", () => finish(input.value.trim()));
+  queueMicrotask(() => {
+    input.focus();
+    input.select();
+  });
+  return input;
+}
 var Histogram = class {
-  constructor(spec) {
+  constructor(spec, edit = null) {
     this.spec = spec;
-    const rows = spec.options.map((option) => {
-      const fill = h("div", { class: "fill" });
-      const ghost = h("div", { class: "ghost" });
-      const pct = h("span", { class: "pct", text: "\u2013" });
-      const delta = h("span", { class: "delta" });
-      const root = h(
-        "div",
-        { class: "hrow", attrs: { title: option.description } },
-        h("span", { class: "hlabel", text: option.label }),
-        h("div", { class: "track" }, fill, ghost),
-        h("span", { class: "hval" }, pct, delta)
-      );
-      this.rows.set(option.label, { root, fill, ghost, pct, delta });
-      return root;
-    });
-    this.el = h("section", { class: "hist" }, h("h3", { text: spec.name, attrs: { title: spec.question } }), h("div", { class: "hrows" }, ...rows));
+    this.edit = edit;
+    this.render();
   }
-  spec;
-  el;
+  el = h("section", { class: "hist" });
   rows = /* @__PURE__ */ new Map();
+  last = null;
   update(dist, baseline) {
+    this.last = { dist, baseline };
     const top = topLabel(dist);
     for (const [label, row] of this.rows) {
       const p = dist[label] ?? 0;
@@ -778,6 +852,84 @@ var Histogram = class {
       row.delta.className = `delta${shift > 0 ? " up" : shift < 0 ? " down" : ""}`;
     }
   }
+  commit(next) {
+    this.edit?.(next);
+  }
+  render() {
+    const editable = !!this.edit;
+    const name = h("span", { class: "hname", text: this.spec.name, attrs: { title: this.spec.question } });
+    const title = h("h3", {}, name);
+    if (editable) {
+      name.classList.add("editable");
+      name.addEventListener("click", () => {
+        const input = inlineInput(this.spec.name, (value) => {
+          if (value && value !== this.spec.name) this.commit({ ...this.spec, name: value });
+          else this.render();
+        });
+        title.replaceChildren(input);
+      });
+    }
+    this.rows.clear();
+    const rows = this.spec.options.map((option) => this.renderRow(option.label, option.description));
+    const children = [title, h("div", { class: "hrows" }, ...rows)];
+    if (editable) {
+      const add = h("button", { class: "add-option", text: "+ option" });
+      add.addEventListener("click", () => {
+        const input = inlineInput(
+          "",
+          (value) => {
+            if (!value) return this.render();
+            if (this.spec.options.some((o) => o.label.toLowerCase() === value.toLowerCase())) {
+              replay(this.el, "reject");
+              return this.render();
+            }
+            this.commit({ ...this.spec, options: [...this.spec.options, { label: value, description: "" }] });
+          },
+          "new option"
+        );
+        add.replaceWith(h("div", { class: "hrow adding" }, input));
+      });
+      children.push(add);
+    }
+    this.el.replaceChildren(...children);
+    if (this.last) this.update(this.last.dist, this.last.baseline);
+  }
+  renderRow(label, description) {
+    const fill = h("div", { class: "fill" });
+    const ghost = h("div", { class: "ghost" });
+    const pct = h("span", { class: "pct", text: "\u2013" });
+    const delta = h("span", { class: "delta" });
+    const labelEl = h("span", { class: "hlabel", text: label, attrs: { title: description ? `${label}: ${description}` : label } });
+    const parts = [labelEl, h("div", { class: "track" }, fill, ghost), h("span", { class: "hval" }, pct, delta)];
+    if (this.edit) {
+      labelEl.classList.add("editable");
+      labelEl.addEventListener("click", () => {
+        const input = inlineInput(label, (value) => {
+          if (value === null || value === label) return this.render();
+          if (!value) return this.remove(label);
+          if (this.spec.options.some((o) => o.label !== label && o.label.toLowerCase() === value.toLowerCase())) {
+            replay(this.el, "reject");
+            return this.render();
+          }
+          this.commit({ ...this.spec, options: this.spec.options.map((o) => o.label === label ? { label: value, description: "" } : o) });
+        });
+        labelEl.replaceChildren(input);
+      });
+      const remove = h("button", { class: "remove-option", text: "\xD7", attrs: { title: `Remove ${label}`, "aria-label": `Remove ${label}` } });
+      remove.addEventListener("click", () => this.remove(label));
+      parts.push(remove);
+    }
+    const root = h("div", { class: "hrow" }, ...parts);
+    this.rows.set(label, { root, fill, ghost, pct, delta });
+    return root;
+  }
+  remove(label) {
+    if (this.spec.options.length <= 2) {
+      replay(this.el, "reject");
+      return this.render();
+    }
+    this.commit({ ...this.spec, options: this.spec.options.filter((o) => o.label !== label) });
+  }
 };
 
 // src/analysis/ClassificationPanel.ts
@@ -789,8 +941,8 @@ var ClassificationPanel = class {
     const block = () => h("section", { class: "hist skeleton" }, h("h3"), h("div", { class: "hrows" }, ...Array.from({ length: 4 }, () => h("div", { class: "hrow" }, h("div", { class: "track" })))));
     this.el.replaceChildren(...Array.from({ length: QUESTION_COUNT }, block));
   }
-  setSpecs(specs) {
-    this.histograms = specs.map((spec) => new Histogram(spec));
+  setSpecs(specs, onEdit) {
+    this.histograms = specs.map((spec) => new Histogram(spec, onEdit ?? null));
     this.el.replaceChildren(...this.histograms.map((x) => x.el));
     this.el.classList.add("pending");
   }
@@ -954,14 +1106,50 @@ var DialSentence = class {
     this.backend = backend;
     this.tokens = tokenize(text);
     registry.set(this.el, this);
+    this.el.addEventListener("click", (ev) => {
+      const el2 = ev.target instanceof Element ? ev.target.closest(".tok.word") : null;
+      if (!el2 || !this.el.contains(el2)) return;
+      this.events.emit("pick", { index: Number(el2.dataset.i) });
+    });
     this.render();
   }
-  backend;
   el = h("div", { class: "dial-sentence" });
   events = new Emitter();
   tokens;
   generation = 0;
   inflight = /* @__PURE__ */ new Map();
+  picked = null;
+  setPicked(index) {
+    this.picked = index;
+    for (const t of this.tokens) t.el?.classList.toggle("picked", t.i === index);
+  }
+  marked(index, replacement) {
+    return this.tokens.map((t) => t.i === index ? `\u27E6${replacement ?? t.text}\u27E7` : t.text).join("");
+  }
+  withReplacement(index, replacement) {
+    return this.tokens.map((t) => t.i === index ? replacement : t.text).join("");
+  }
+  replaceToken(index, text) {
+    const t = this.tokens[index];
+    if (!t || !text.trim() || t.text === text) return;
+    const dir = 1;
+    t.text = text;
+    t.orig = text;
+    t.level = 0;
+    t.limit = { up: null, down: null };
+    const base = t.ladder.get(0);
+    t.ladder = /* @__PURE__ */ new Map();
+    if (t.kind) t.ladder.set(0, { text, valence: base?.valence ?? 0, intensity: base?.intensity ?? 0.5 });
+    for (const key2 of [...this.inflight.keys()]) if (key2.split(":")[1] === String(index)) this.inflight.delete(key2);
+    if (t.el) {
+      if (t.kind) this.swapText(t, dir);
+      else t.el.textContent = text;
+      replay(t.el, "flash", 500);
+    }
+    this.fixArticle(t);
+    this.events.emit("ladder", t);
+    this.events.emit("change", { text: this.text, reason: "swap" });
+  }
   get text() {
     return this.tokens.map((t) => t.text).join("");
   }
@@ -1078,7 +1266,7 @@ var DialSentence = class {
     const promise = this.backend().nextRung(request).then((res) => {
       this.inflight.delete(key2);
       if (!this.alive(t)) return null;
-      const text = res.replacement.trim();
+      const text = this.matchCase(t, res.replacement);
       const seen = [...t.ladder.values()].some((r) => r.text.toLowerCase() === text.toLowerCase());
       if (!text || res.atLimit || seen || text.split(/\s+/).length > 5) {
         if (dir > 0) t.limit.up = from;
@@ -1170,6 +1358,7 @@ var DialSentence = class {
         el2.append(h("span", { class: "inner", text: t.text }));
       } else el2.textContent = t.text;
       t.el = el2;
+      if (t.i === this.picked) el2.classList.add("picked");
       if (t.kind) this.paint(t);
       return el2;
     });
@@ -1336,7 +1525,7 @@ function installDialInteractions() {
       unlockAudio();
       const t = locateToken(ev.target);
       if (!t?.tok.el) return;
-      drag = { ...t, y: ev.clientY, id: ev.pointerId };
+      drag = { ...t, y: ev.clientY, id: ev.pointerId, moved: false };
       t.tok.el.setPointerCapture(ev.pointerId);
       ladder.show(t.dial, t.tok);
     },
@@ -1348,11 +1537,20 @@ function installDialInteractions() {
     const step = ev.pointerType === "mouse" ? 18 : 26;
     if (Math.abs(dy) < step) return;
     drag.y = ev.clientY;
+    drag.moved = true;
     void drag.dial.go(drag.tok, Math.sign(dy));
   });
   const endDrag = (ev) => {
     if (!drag || ev.pointerId !== drag.id) return;
     if (ev.pointerType !== "mouse") ladder.hide(700);
+    if (drag.moved) {
+      const swallow = (e) => {
+        e.stopPropagation();
+        e.preventDefault();
+      };
+      document.addEventListener("click", swallow, { capture: true, once: true });
+      window.setTimeout(() => document.removeEventListener("click", swallow, { capture: true }), 0);
+    }
     drag = null;
   };
   document.addEventListener("pointerup", endDrag);
@@ -1397,13 +1595,13 @@ var SentenceCard = class {
         this.scheduleClassify();
       }),
       this.dial.events.on("status", ({ kind, text }) => this.setStatus(kind === "idle" ? "" : text, kind === "error")),
-      this.dial.events.on("warning", (message) => toast(message))
+      this.dial.events.on("warning", (message) => toast(message)),
+      this.dial.events.on("pick", ({ index }) => this.deps.onPick(this, index))
     );
   }
-  record;
-  deps;
   el;
   dial;
+  events = new Emitter();
   panel = new ClassificationPanel();
   statusEl = h("div", { class: "card-status" });
   unsubscribe = [];
@@ -1437,6 +1635,9 @@ var SentenceCard = class {
     }
     await this.classify();
   }
+  get specs() {
+    return this.record.specs;
+  }
   resetToOriginal() {
     this.dial.resetAll();
     if (this.dial.text !== this.record.original) void this.dial.load(this.record.original);
@@ -1447,10 +1648,36 @@ var SentenceCard = class {
     ladder.hideIfInside(this.el);
     for (const off of this.unsubscribe) off();
     this.dial.events.clear();
+    this.events.clear();
+  }
+  showSpecs(specs) {
+    this.panel.setSpecs(specs, (next) => this.editSpec(next));
+  }
+  editSpec(next) {
+    const specs = (this.record.specs ?? []).map((s) => s.id === next.id ? next : s);
+    this.record.specs = specs;
+    this.record.baseline = null;
+    this.deps.onChange(this);
+    this.showSpecs(specs);
+    this.events.emit("specs", specs);
+    void this.regenerateBaseline(specs);
+  }
+  async regenerateBaseline(specs) {
+    if (this.dial.text !== this.record.original) {
+      const seq = ++this.classifySeq;
+      try {
+        const baseline = await this.deps.backend().classify(this.record.original, specs);
+        if (seq !== this.classifySeq) return;
+        this.record.baseline = baseline;
+        this.deps.onChange(this);
+      } catch {
+      }
+    }
+    await this.classify();
   }
   prepareQuestions() {
     if (this.record.specs) {
-      this.panel.setSpecs(this.record.specs);
+      this.showSpecs(this.record.specs);
       return Promise.resolve(this.record.specs);
     }
     if (this.questionsPromise) return this.questionsPromise;
@@ -1458,7 +1685,8 @@ var SentenceCard = class {
     this.questionsPromise = this.deps.backend().proposeQuestions(this.record.original).then((specs) => {
       this.record.specs = specs;
       this.deps.onChange(this);
-      this.panel.setSpecs(specs);
+      this.showSpecs(specs);
+      this.events.emit("specs", specs);
       return specs;
     }).catch((err) => {
       this.panel.showError(errorMessage(err), () => void this.prepareQuestions().then(() => this.classify()));
@@ -1565,6 +1793,360 @@ var SettingsDialog = class {
   }
 };
 
+// src/ui/SwapPanel.ts
+var KIND_LABEL = {
+  original: "original",
+  synonym: "synonym",
+  stronger: "stronger",
+  weaker: "weaker",
+  opposite: "opposite",
+  formal: "formal",
+  casual: "casual",
+  shift: "shift",
+  custom: "yours"
+};
+var SwapPanel = class {
+  constructor(deps) {
+    this.deps = deps;
+    this.el.hidden = true;
+    this.input.addEventListener("keydown", (ev) => {
+      if (ev.key !== "Enter") return;
+      ev.preventDefault();
+      const value = this.input.value;
+      this.input.value = "";
+      void this.addCustom(value);
+    });
+    const seg = h("div", { class: "seg", attrs: { role: "group", "aria-label": "Sort" } });
+    for (const mode of ["kind", "flips"]) {
+      const b = h("button", { text: mode === "kind" ? "By kind" : "Most flips" });
+      b.addEventListener("click", () => {
+        this.sort = mode;
+        this.syncSort();
+        this.renderBody();
+      });
+      this.sortButtons.set(mode, b);
+      seg.append(b);
+    }
+    this.staleEl.append(
+      h("span", { text: "The sentence changed." }),
+      h("button", { class: "link", text: "Re-run for this sentence", on: { click: () => this.card && this.reopen() } })
+    );
+    const close = h("button", { class: "icon-btn sm", html: icons.close, attrs: { title: "Close", "aria-label": "Close swaps" }, on: { click: () => this.close() } });
+    this.el.append(
+      h("div", { class: "swap-head" }, h("span", { class: "swap-eyebrow", text: "Swap" }), this.wordEl, h("span", { class: "grow" }), close),
+      this.contextEl,
+      h("div", { class: "swap-tools" }, this.input, seg),
+      this.staleEl,
+      this.infoEl,
+      h("div", { class: "swap-table" }, h("table", {}, this.colgroup, this.thead, this.tbody))
+    );
+    this.tbody.addEventListener("mouseleave", () => this.showPreview(null));
+    this.resize.observe(this.contextEl);
+    this.syncSort();
+  }
+  el = h("aside", { class: "swap", attrs: { "aria-label": "Word swaps" } });
+  wordEl = h("span", { class: "swap-word" });
+  contextEl = h("p", { class: "swap-context" });
+  markEl = h("mark");
+  input = h("input", { class: "swap-input", attrs: { type: "text", placeholder: "Try your own word\u2026", spellcheck: "false", "aria-label": "Your own replacement" } });
+  sortButtons = /* @__PURE__ */ new Map();
+  infoEl = h("div", { class: "swap-info" });
+  staleEl = h("div", { class: "swap-stale" });
+  colgroup = h("colgroup");
+  thead = h("thead");
+  tbody = h("tbody");
+  resize = new ResizeObserver(() => {
+    if (this.contextEl.clientWidth !== this.lastWidth) this.lockContextHeight();
+  });
+  card = null;
+  index = -1;
+  variants = [];
+  baseIdx = 0;
+  sort = "kind";
+  status = "";
+  stale = false;
+  applying = false;
+  seq = 0;
+  specKey = "";
+  lastWidth = 0;
+  unsubscribe = [];
+  open(card, index) {
+    const tok = card.dial.tokens[index];
+    if (!tok?.word) return;
+    if (this.card === card && this.index === index && !this.stale) return;
+    this.detach();
+    this.card = card;
+    this.index = index;
+    this.variants = [{ text: tok.text, kind: "original", result: null }];
+    this.baseIdx = 0;
+    this.stale = false;
+    this.specKey = "";
+    card.dial.setPicked(index);
+    this.unsubscribe.push(
+      card.dial.events.on("change", ({ reason }) => {
+        if (this.applying || reason === "swap") return;
+        this.stale = true;
+        this.renderChrome();
+      }),
+      card.events.on("specs", () => void this.classifyAll())
+    );
+    this.el.hidden = false;
+    this.deps.onVisibilityChange(true);
+    this.renderContext();
+    this.renderChrome();
+    this.renderBody();
+    void this.run();
+  }
+  close() {
+    this.detach();
+    this.card = null;
+    this.el.hidden = true;
+    this.deps.onVisibilityChange(false);
+  }
+  closeIfCard(card) {
+    if (this.card === card) this.close();
+  }
+  reopen() {
+    const card = this.card;
+    if (!card) return;
+    this.stale = true;
+    this.open(card, this.index);
+  }
+  detach() {
+    this.seq++;
+    for (const off of this.unsubscribe) off();
+    this.unsubscribe = [];
+    this.card?.dial.setPicked(null);
+  }
+  get specs() {
+    return this.card?.specs ?? [];
+  }
+  get base() {
+    return this.variants[this.baseIdx];
+  }
+  range(from, to) {
+    return Array.from({ length: to - from }, (_, i) => from + i);
+  }
+  async run() {
+    const card = this.card;
+    if (!card) return;
+    const seq = ++this.seq;
+    this.setStatus("Finding replacements\u2026");
+    const classifyOriginal = this.classifyVariants([0], seq);
+    try {
+      const options = await this.deps.backend().proposeSwaps({
+        sentence: card.dial.text,
+        marked: card.dial.marked(this.index),
+        word: this.variants[0].text,
+        specs: this.specs
+      });
+      if (seq !== this.seq) return;
+      const start = this.variants.length;
+      this.variants.push(...options.map((o) => ({ text: o.text, kind: o.kind, result: null })));
+      this.lockContextHeight();
+      this.renderBody();
+      await Promise.all([classifyOriginal, this.classifyVariants(this.range(start, this.variants.length), seq)]);
+    } catch (err) {
+      if (seq === this.seq) this.setStatus(errorMessage(err));
+    }
+  }
+  async classifyAll() {
+    for (const v of this.variants) v.result = null;
+    this.renderBody();
+    await this.classifyVariants(this.range(0, this.variants.length), this.seq);
+  }
+  async classifyVariants(indices, seq) {
+    const card = this.card;
+    const specs = this.specs;
+    if (!card || !indices.length) return;
+    if (!specs.length) {
+      this.setStatus("Waiting for this card\u2019s questions\u2026");
+      return;
+    }
+    this.setStatus(`Classifying ${indices.length} variant${indices.length > 1 ? "s" : ""}\u2026`);
+    const sentences = indices.map((i) => card.dial.withReplacement(this.index, this.variants[i].text));
+    try {
+      const results = await this.deps.backend().classifyMany(sentences, specs);
+      if (seq !== this.seq) return;
+      indices.forEach((vi, k) => {
+        this.variants[vi].result = results[k] ?? null;
+        this.variants[vi].error = !results[k];
+      });
+      this.setStatus("");
+    } catch (err) {
+      if (seq !== this.seq) return;
+      for (const vi of indices) this.variants[vi].error = true;
+      this.setStatus(errorMessage(err));
+    }
+    this.renderBody();
+  }
+  modelsChanged() {
+    if (!this.card) return;
+    this.specKey = "";
+    void this.classifyAll();
+  }
+  async addCustom(text) {
+    const clean2 = text.trim();
+    if (!clean2 || !this.card) return;
+    if (this.variants.some((v) => v.text.toLowerCase() === clean2.toLowerCase())) return;
+    this.variants.push({ text: clean2, kind: "custom", result: null });
+    this.lockContextHeight();
+    this.renderBody();
+    await this.classifyVariants([this.variants.length - 1], this.seq);
+  }
+  apply(i) {
+    const card = this.card;
+    const v = this.variants[i];
+    if (!card || !v || i === this.baseIdx) return;
+    this.applying = true;
+    card.dial.replaceToken(this.index, v.text);
+    this.applying = false;
+    this.baseIdx = i;
+    this.renderContext();
+    this.renderChrome();
+    this.renderBody();
+    this.showPreview(null);
+  }
+  flips(v) {
+    const base = this.base?.result;
+    const res = v.result;
+    if (!base || !res) return 0;
+    let n = 0;
+    for (const spec of this.specs) {
+      const b = base[spec.id];
+      const r = res[spec.id];
+      if (b && r && topLabel(r) !== topLabel(b)) n++;
+    }
+    return n;
+  }
+  shift(v) {
+    const base = this.base?.result;
+    const res = v.result;
+    if (!base || !res) return 0;
+    let total = 0;
+    for (const spec of this.specs) {
+      const b = base[spec.id];
+      const r = res[spec.id];
+      if (!b || !r) continue;
+      for (const label of Object.keys(b)) total += Math.abs((r[label] ?? 0) - b[label]);
+    }
+    return total;
+  }
+  ordered() {
+    const rest = this.range(0, this.variants.length).filter((i) => i !== this.baseIdx);
+    if (this.sort === "flips") {
+      rest.sort((a, b) => this.flips(this.variants[b]) - this.flips(this.variants[a]) || this.shift(this.variants[b]) - this.shift(this.variants[a]));
+    }
+    return [this.baseIdx, ...rest];
+  }
+  setStatus(text) {
+    this.status = text;
+    this.renderChrome();
+  }
+  syncSort() {
+    for (const [mode, b] of this.sortButtons) b.classList.toggle("on", mode === this.sort);
+  }
+  renderContext() {
+    const card = this.card;
+    if (!card) return;
+    this.wordEl.textContent = this.base.text;
+    this.markEl.textContent = this.base.text;
+    this.markEl.classList.remove("preview");
+    const before = card.dial.tokens.slice(0, this.index).map((t) => t.text).join("");
+    const after = card.dial.tokens.slice(this.index + 1).map((t) => t.text).join("");
+    this.contextEl.replaceChildren(before, this.markEl, after);
+    this.lockContextHeight();
+  }
+  lockContextHeight() {
+    if (this.el.hidden || !this.card) return;
+    const width = this.contextEl.clientWidth;
+    if (!width) return;
+    const shown = this.markEl.textContent;
+    this.contextEl.style.minHeight = "";
+    let max = this.contextEl.offsetHeight;
+    for (const v of this.variants) {
+      this.markEl.textContent = v.text;
+      max = Math.max(max, this.contextEl.offsetHeight);
+    }
+    this.markEl.textContent = shown;
+    this.contextEl.style.minHeight = `${max}px`;
+    this.lastWidth = width;
+  }
+  showPreview(text) {
+    const shown = text ?? this.base.text;
+    this.markEl.textContent = shown;
+    this.markEl.classList.toggle("preview", shown !== this.base.text);
+  }
+  renderChrome() {
+    this.staleEl.hidden = !this.stale;
+    const done = this.variants.filter((v, i) => i !== this.baseIdx && v.result);
+    this.infoEl.replaceChildren();
+    this.infoEl.classList.remove("flipped");
+    if (this.status) {
+      this.infoEl.textContent = this.status;
+    } else if (done.length) {
+      const flipped = done.filter((v) => this.flips(v) > 0).length;
+      if (flipped) this.infoEl.classList.add("flipped");
+      this.infoEl.append(h("b", { text: `${flipped} of ${done.length}` }), " replacements flip at least one answer");
+    }
+  }
+  renderHead(specs) {
+    const key2 = specs.map((s) => `${s.id}:${s.name}`).join("|");
+    if (key2 === this.specKey) return;
+    this.specKey = key2;
+    this.colgroup.replaceChildren(h("col", { class: "c-word" }), ...specs.map(() => h("col", { class: "c-q" })));
+    this.thead.replaceChildren(h("tr", {}, h("th", { text: "Word" }), ...specs.map((s) => h("th", { attrs: { title: `${s.name}: ${s.question}` } }, h("span", { class: "th-text", text: s.name })))));
+  }
+  renderBody() {
+    if (!this.card) return;
+    const specs = this.specs;
+    this.renderHead(specs);
+    this.tbody.replaceChildren(...this.ordered().map((i) => this.renderRow(i, specs)));
+    this.renderChrome();
+  }
+  renderRow(i, specs) {
+    const v = this.variants[i];
+    const base = this.base.result;
+    const isBase = i === this.baseIdx;
+    const tag = isBase ? "current" : KIND_LABEL[v.kind];
+    const nameCell = h("td", { class: "swap-name" }, h("div", { class: "swap-text", text: v.text }), h("div", { class: `kind kind-${isBase ? "current" : v.kind}`, text: tag }));
+    const cells = specs.map((spec) => {
+      const dist = v.result?.[spec.id];
+      if (!dist) return h("td", { class: `swap-cell${v.error ? " err" : " wait"}` }, h("div", { class: "shimmer" }), h("div", { class: "shimmer short" }));
+      const top = topLabel(dist);
+      const b = base?.[spec.id];
+      const baseTop = b ? topLabel(b) : top;
+      const flip = !isBase && top !== baseTop;
+      const p = Math.round((dist[top] ?? 0) * 100);
+      const drift = !isBase && !flip && b ? Math.round(((dist[baseTop] ?? 0) - (b[baseTop] ?? 0)) * 100) : 0;
+      const title = Object.entries(dist).map(([label, q]) => `${label} ${Math.round(q * 100)}%`).join(", ");
+      return h(
+        "td",
+        { class: `swap-cell${flip ? " flip" : ""}`, attrs: { title } },
+        h("span", { class: "cl", text: top }),
+        h("span", { class: "cn" }, h("span", { class: "cp", text: `${p}%` }), drift ? h("span", { class: `cd ${drift > 0 ? "up" : "down"}`, text: `${drift > 0 ? "+" : "\u2212"}${Math.abs(drift)}` }) : null)
+      );
+    });
+    const row = h("tr", { class: isBase ? "base" : "" }, nameCell, ...cells);
+    if (!isBase) {
+      row.tabIndex = 0;
+      row.title = "Click to use this word";
+      row.addEventListener("click", () => this.apply(i));
+      row.addEventListener("keydown", (ev) => {
+        if (ev.key === "Enter") this.apply(i);
+      });
+      row.addEventListener("mouseenter", () => this.showPreview(v.text));
+      row.addEventListener("focus", () => {
+        if (row.matches(":focus-visible")) this.showPreview(v.text);
+      });
+      row.addEventListener("blur", () => this.showPreview(null));
+    } else {
+      row.addEventListener("mouseenter", () => this.showPreview(null));
+    }
+    return row;
+  }
+};
+
 // src/app.ts
 var STORE_KEY = "cards";
 var App = class {
@@ -1572,14 +2154,26 @@ var App = class {
   list = h("div", { class: "cards" });
   settingsDialog = new SettingsDialog();
   composer = new Composer((text) => this.add(text));
+  shell = h("div", { class: "shell" });
+  swap = new SwapPanel({
+    backend: currentBackend,
+    onVisibilityChange: (open) => this.shell.classList.toggle("with-swap", open)
+  });
   constructor(root) {
     const header = new Header(() => this.openSettings());
-    root.append(h("div", { class: "wrap" }, header.el, this.composer.el, this.list));
+    this.shell.append(h("div", { class: "wrap" }, header.el, this.composer.el, this.list), this.swap.el);
+    root.append(this.shell);
+    document.addEventListener("keydown", (ev) => {
+      if (ev.key === "Escape" && !this.swap.el.hidden && !(ev.target instanceof HTMLInputElement) && !(ev.target instanceof HTMLTextAreaElement)) this.swap.close();
+    });
     settingsEvents.on("change", ({ previous }) => {
       applyTheme(settings.theme);
       const backendChanged = previous.mock !== settings.mock || previous.llmModel !== settings.llmModel || previous.jevModel !== settings.jevModel || previous.jevEndpoint !== settings.jevEndpoint;
       const keysAdded = !previous.orKey && !!settings.orKey || !previous.tsKey && !!settings.tsKey;
-      if (backendChanged || keysAdded) for (const card of this.cards) void card.restart();
+      if (backendChanged || keysAdded) {
+        this.swap.close();
+        for (const card of this.cards) void card.restart();
+      }
     });
     const stored = storage.getJSON(STORE_KEY, []);
     if (stored.length) for (const record of [...stored].reverse()) this.mount(record, false);
@@ -1597,7 +2191,8 @@ var App = class {
     const card = new SentenceCard(record, {
       backend: currentBackend,
       onChange: () => this.persist(),
-      onRemove: (c) => this.remove(c)
+      onRemove: (c) => this.remove(c),
+      onPick: (c, index) => this.swap.open(c, index)
     });
     this.cards.unshift(card);
     this.list.prepend(card.el);
@@ -1608,6 +2203,7 @@ var App = class {
     const i = this.cards.indexOf(card);
     if (i < 0) return;
     this.cards.splice(i, 1);
+    this.swap.closeIfCard(card);
     card.dispose();
     this.persist();
     const el2 = card.el;

@@ -4,7 +4,7 @@ import { DialSentence } from '../dial/DialSentence';
 import { attachDial } from '../dial/interactions';
 import { ladder } from '../dial/Ladder';
 import type { Backend, Classification, QuestionSpec } from '../types';
-import { debounce, errorMessage, h } from '../util';
+import { debounce, Emitter, errorMessage, h } from '../util';
 import { icons } from './icons';
 import { toast } from './toast';
 
@@ -20,11 +20,13 @@ export interface CardDeps {
   backend: () => Backend;
   onChange: (card: SentenceCard) => void;
   onRemove: (card: SentenceCard) => void;
+  onPick: (card: SentenceCard, index: number) => void;
 }
 
 export class SentenceCard {
   readonly el: HTMLElement;
-  private readonly dial: DialSentence;
+  readonly dial: DialSentence;
+  readonly events = new Emitter<{ specs: QuestionSpec[] }>();
   private readonly panel = new ClassificationPanel();
   private readonly statusEl = h('div', { class: 'card-status' });
   private readonly unsubscribe: (() => void)[] = [];
@@ -51,7 +53,8 @@ export class SentenceCard {
         this.scheduleClassify();
       }),
       this.dial.events.on('status', ({ kind, text }) => this.setStatus(kind === 'idle' ? '' : text, kind === 'error')),
-      this.dial.events.on('warning', message => toast(message))
+      this.dial.events.on('warning', message => toast(message)),
+      this.dial.events.on('pick', ({ index }) => this.deps.onPick(this, index))
     );
   }
 
@@ -84,6 +87,10 @@ export class SentenceCard {
     await this.classify();
   }
 
+  get specs(): QuestionSpec[] | null {
+    return this.record.specs;
+  }
+
   resetToOriginal(): void {
     this.dial.resetAll();
     if (this.dial.text !== this.record.original) void this.dial.load(this.record.original);
@@ -95,11 +102,39 @@ export class SentenceCard {
     ladder.hideIfInside(this.el);
     for (const off of this.unsubscribe) off();
     this.dial.events.clear();
+    this.events.clear();
+  }
+
+  private showSpecs(specs: QuestionSpec[]): void {
+    this.panel.setSpecs(specs, next => this.editSpec(next));
+  }
+
+  private editSpec(next: QuestionSpec): void {
+    const specs = (this.record.specs ?? []).map(s => (s.id === next.id ? next : s));
+    this.record.specs = specs;
+    this.record.baseline = null;
+    this.deps.onChange(this);
+    this.showSpecs(specs);
+    this.events.emit('specs', specs);
+    void this.regenerateBaseline(specs);
+  }
+
+  private async regenerateBaseline(specs: QuestionSpec[]): Promise<void> {
+    if (this.dial.text !== this.record.original) {
+      const seq = ++this.classifySeq;
+      try {
+        const baseline = await this.deps.backend().classify(this.record.original, specs);
+        if (seq !== this.classifySeq) return;
+        this.record.baseline = baseline;
+        this.deps.onChange(this);
+      } catch {}
+    }
+    await this.classify();
   }
 
   private prepareQuestions(): Promise<QuestionSpec[] | null> {
     if (this.record.specs) {
-      this.panel.setSpecs(this.record.specs);
+      this.showSpecs(this.record.specs);
       return Promise.resolve(this.record.specs);
     }
     if (this.questionsPromise) return this.questionsPromise;
@@ -110,7 +145,8 @@ export class SentenceCard {
       .then(specs => {
         this.record.specs = specs;
         this.deps.onChange(this);
-        this.panel.setSpecs(specs);
+        this.showSpecs(specs);
+        this.events.emit('specs', specs);
         return specs;
       })
       .catch(err => {

@@ -6,6 +6,9 @@ import {
   QUESTIONS_SYSTEM,
   STEP_SCHEMA,
   STEP_SYSTEM,
+  SWAP_KINDS,
+  SWAP_SCHEMA,
+  SWAP_SYSTEM,
   TAG_SCHEMA,
   TAG_SYSTEM,
   VALENCE_LEVELS,
@@ -15,7 +18,7 @@ import { chatJSON, hasLlmAccess } from '../services/openrouter';
 import { systemOne, systemOneBatched, type JevQuestions } from '../services/jev';
 import { QUESTION_FALLBACK_LLMS } from '../config';
 import { settings } from '../settings';
-import type { Backend, StepResult, WordKind, WordRef, WordTag } from '../types';
+import type { Backend, StepResult, SwapKind, SwapOption, WordKind, WordRef, WordTag } from '../types';
 import { errorMessage, num } from '../util';
 
 const key = (index: number) => `w${index}`;
@@ -79,6 +82,10 @@ async function tagWithLlm(sentence: string, words: WordRef[]): Promise<WordTag[]
       valence: num(it.valence, -1, 1, 0),
       intensity: num(it.intensity, 0, 1, 0.5)
     }));
+}
+
+interface SwapJSON {
+  alternatives?: { text?: string; kind?: string }[];
 }
 
 interface StepJSON {
@@ -159,5 +166,32 @@ export const liveBackend: Backend = {
         return [spec.id, normalizeDistribution(spec, a?.type === 'choice' ? a.probabilities : a?.type === 'score' ? a.probabilities : undefined)];
       })
     );
+  },
+
+  async classifyMany(sentences, specs) {
+    return Promise.all(sentences.map(sentence => this.classify(sentence, specs)));
+  },
+
+  async proposeSwaps(req) {
+    const questions = req.specs.map(s => ({ name: s.name, question: s.question, options: s.options.map(o => o.label) }));
+    const res = await chatJSON<SwapJSON>(
+      [
+        { role: 'system', content: SWAP_SYSTEM },
+        { role: 'user', content: JSON.stringify({ sentence: req.marked, span: req.word, classifier_questions: questions }, null, 1) }
+      ],
+      SWAP_SCHEMA,
+      { maxTokens: 2500, temperature: 0.8 }
+    );
+    const seen = new Set([req.word.toLowerCase()]);
+    const out: SwapOption[] = [];
+    for (const alt of res.alternatives ?? []) {
+      const text = String(alt.text ?? '').trim().replace(/^["'“”]+|["'“”.,;:!?]+$/g, '');
+      if (!text || seen.has(text.toLowerCase()) || text.split(/\s+/).length > 5) continue;
+      seen.add(text.toLowerCase());
+      const kind = (SWAP_KINDS as readonly string[]).includes(alt.kind ?? '') ? (alt.kind as SwapKind) : 'synonym';
+      out.push({ text, kind });
+    }
+    if (!out.length) throw new Error('The model did not propose any usable alternatives');
+    return out;
   }
 };

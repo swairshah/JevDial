@@ -56,10 +56,26 @@ export interface QuestionSpec {
 export type Distribution = Record<string, number>;
 export type Classification = Record<string, Distribution>;
 
+export type SwapKind = 'synonym' | 'stronger' | 'weaker' | 'opposite' | 'formal' | 'casual' | 'shift' | 'custom';
+
+export interface SwapOption {
+  text: string;
+  kind: SwapKind;
+}
+
+export interface SwapRequest {
+  sentence: string;
+  marked: string;
+  word: string;
+  specs: QuestionSpec[];
+}
+
 export interface Backend {
   readonly id: 'live' | 'mock';
   tagWords(sentence: string, words: WordRef[]): Promise<TagResult>;
   nextRung(request: StepRequest): Promise<StepResult>;
   proposeQuestions(sentence: string): Promise<QuestionSpec[]>;
   classify(sentence: string, specs: QuestionSpec[]): Promise<Classification>;
+  classifyMany(sentences: string[], specs: QuestionSpec[]): Promise<Classification[]>;
+  proposeSwaps(request: SwapRequest): Promise<SwapOption[]>;
 }
