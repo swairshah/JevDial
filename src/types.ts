@@ -110,6 +110,7 @@ export interface Backend {
   tagWords(sentence: string, words: WordRef[]): Promise<TagResult>;
   nextRung(request: StepRequest): Promise<StepResult>;
   proposeQuestions(sentence: string): Promise<QuestionSpec[]>;
+  proposeCategory(sentence: string, name: string, existing: QuestionSpec[]): Promise<QuestionSpec>;
   classify(sentence: string, specs: QuestionSpec[], model: S1Id): Promise<Classification>;
   classifyMany(sentences: string[], specs: QuestionSpec[], model: S1Id): Promise<Classification[]>;
   proposeSwaps(request: SwapRequest): Promise<SwapOption[]>;

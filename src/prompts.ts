@@ -160,3 +160,32 @@ export const SWAP_SCHEMA = {
   required: ['alternatives'],
   additionalProperties: false
 };
+
+export const CATEGORY_SYSTEM = `You design one classification question for a System-1 classifier (it reads a short message and returns a probability for each option, judging only the text against each option's one-sentence description).
+The user names a category they want to measure. You receive the message it will first be applied to and the questions that already exist.
+Write a question for that category that works for this kind of message in general, not just this one sentence:
+- "name": the category in 1 to 3 words, Title Case (keep the user's wording when it is already good)
+- "question": one sentence asked about the message
+- "kind": "scale" if the options are ordered degrees, otherwise "category"
+- "options": 3 to 7 mutually exclusive options that together cover realistic messages of this kind. Order scales from one end to the other. Add "other" (or "none" / "not mentioned") when the set is open. Labels are 1 to 3 lowercase words; each description is one sentence with a concrete textual cue that marks the boundary.
+Do not duplicate an existing question. Reply with JSON only: {"name":string,"question":string,"kind":"category"|"scale","options":[{"label":string,"description":string}]}`;
+
+export const CATEGORY_SCHEMA = {
+  type: 'object',
+  properties: {
+    name: { type: 'string' },
+    question: { type: 'string' },
+    kind: { type: 'string', enum: ['category', 'scale'] },
+    options: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: { label: { type: 'string' }, description: { type: 'string' } },
+        required: ['label', 'description'],
+        additionalProperties: false
+      }
+    }
+  },
+  required: ['name', 'question', 'kind', 'options'],
+  additionalProperties: false
+};

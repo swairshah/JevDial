@@ -1,6 +1,6 @@
 import { normalizeDistribution, normalizeQuestions } from '../analysis/questions';
 import type { Backend, WordTag } from '../types';
-import { sleep } from '../util';
+import { sleep, uid } from '../util';
 import { mockDesign, mockItems } from './mockDataset';
 
 const EVALUATIVE_SCALES = [
@@ -88,6 +88,12 @@ export const mockBackend: Backend = {
         options: ['definitely', 'probably', 'unsure', 'unlikely', 'never'].map(label => ({ label, description: label }))
       }
     ]);
+  },
+
+  async proposeCategory(_sentence, name) {
+    await sleep(700);
+    const [spec] = normalizeQuestions([{ name, question: `What ${name.toLowerCase()} does the message express?`, kind: 'scale', options: ['none', 'low', 'moderate', 'high'].map(label => ({ label, description: label })) }], 1);
+    return { ...spec, id: `c${uid()}` };
   },
 
   async designDataset(_description, questionCount) {

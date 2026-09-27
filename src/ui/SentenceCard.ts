@@ -59,6 +59,10 @@ export class SentenceCard {
         )
       : null;
     this.el = h('article', { class: 'card' }, actions, meta, this.dial.el, this.statusEl, this.panel.el);
+    this.panel.setHandlers(
+      name => this.addQuestion(name),
+      id => this.removeQuestion(id)
+    );
     this.unsubscribe.push(
       attachDial(this.dial),
       this.dial.events.on('change', ({ text }) => {
@@ -94,6 +98,29 @@ export class SentenceCard {
 
   get specs(): QuestionSpec[] | null {
     return this.record.specs;
+  }
+
+  private async addQuestion(name: string): Promise<void> {
+    const current = this.record.specs ?? [];
+    const spec = await this.deps.backend().proposeCategory(this.record.original, name, current);
+    const specs = [...(this.record.specs ?? []), spec];
+    this.record.specs = specs;
+    this.record.baselines = {};
+    this.deps.onChange(this);
+    this.showSpecs(specs);
+    this.events.emit('specs', specs);
+    await this.rebaseline(specs);
+  }
+
+  private removeQuestion(id: string): void {
+    const specs = (this.record.specs ?? []).filter(s => s.id !== id);
+    if (!specs.length) return;
+    this.record.specs = specs;
+    if (this.record.expected) delete this.record.expected[id];
+    this.deps.onChange(this);
+    this.showSpecs(specs);
+    this.events.emit('specs', specs);
+    void this.classify();
   }
 
   async modelsChanged(): Promise<void> {

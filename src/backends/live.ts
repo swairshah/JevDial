@@ -2,6 +2,8 @@ import { normalizeDistribution, normalizeQuestions, type RawQuestion } from '../
 import {
   AXES,
   DEGREE_LEVELS,
+  CATEGORY_SCHEMA,
+  CATEGORY_SYSTEM,
   QUESTIONS_SCHEMA,
   QUESTIONS_SYSTEM,
   STEP_SCHEMA,
@@ -21,7 +23,7 @@ import { DESIGN_SCHEMA, DESIGN_SYSTEM, ITEMS_SCHEMA, ITEMS_SYSTEM } from '../dat
 import { normalizeDesign, normalizeItems, type RawDesign, type RawItems } from '../dataset/normalize';
 import { settings } from '../settings';
 import type { Backend, QuestionSpec, S1Id, StepResult, SwapKind, SwapOption, WordKind, WordRef, WordTag } from '../types';
-import { errorMessage, num } from '../util';
+import { errorMessage, num, uid } from '../util';
 
 const key = (index: number) => `w${index}`;
 
@@ -173,6 +175,22 @@ export const liveBackend: Backend = {
       { maxTokens: 4000, temperature: 0.8, model: settings.questionModel, fallbacks: QUESTION_FALLBACK_LLMS, reasoning: 'medium' }
     );
     return normalizeQuestions(res.questions);
+  },
+
+  async proposeCategory(sentence, name, existing) {
+    const res = await chatJSON<RawQuestion>(
+      [
+        { role: 'system', content: CATEGORY_SYSTEM },
+        {
+          role: 'user',
+          content: JSON.stringify({ category: name, message: sentence, existing_questions: existing.map(s => ({ name: s.name, options: s.options.map(o => o.label) })) }, null, 1)
+        }
+      ],
+      CATEGORY_SCHEMA,
+      { model: settings.questionModel, fallbacks: QUESTION_FALLBACK_LLMS, reasoning: 'medium', maxTokens: 3000, temperature: 0.5 }
+    );
+    const [spec] = normalizeQuestions([res], 1);
+    return { ...spec, id: `c${uid()}` };
   },
 
   async classify(sentence, specs, model) {

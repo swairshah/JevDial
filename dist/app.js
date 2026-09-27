@@ -352,6 +352,33 @@ var SWAP_SCHEMA = {
   required: ["alternatives"],
   additionalProperties: false
 };
+var CATEGORY_SYSTEM = `You design one classification question for a System-1 classifier (it reads a short message and returns a probability for each option, judging only the text against each option's one-sentence description).
+The user names a category they want to measure. You receive the message it will first be applied to and the questions that already exist.
+Write a question for that category that works for this kind of message in general, not just this one sentence:
+- "name": the category in 1 to 3 words, Title Case (keep the user's wording when it is already good)
+- "question": one sentence asked about the message
+- "kind": "scale" if the options are ordered degrees, otherwise "category"
+- "options": 3 to 7 mutually exclusive options that together cover realistic messages of this kind. Order scales from one end to the other. Add "other" (or "none" / "not mentioned") when the set is open. Labels are 1 to 3 lowercase words; each description is one sentence with a concrete textual cue that marks the boundary.
+Do not duplicate an existing question. Reply with JSON only: {"name":string,"question":string,"kind":"category"|"scale","options":[{"label":string,"description":string}]}`;
+var CATEGORY_SCHEMA = {
+  type: "object",
+  properties: {
+    name: { type: "string" },
+    question: { type: "string" },
+    kind: { type: "string", enum: ["category", "scale"] },
+    options: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: { label: { type: "string" }, description: { type: "string" } },
+        required: ["label", "description"],
+        additionalProperties: false
+      }
+    }
+  },
+  required: ["name", "question", "kind", "options"],
+  additionalProperties: false
+};
 
 // src/services/proxy.ts
 var proxy = {
@@ -821,6 +848,21 @@ var liveBackend = {
     );
     return normalizeQuestions(res.questions);
   },
+  async proposeCategory(sentence, name, existing) {
+    const res = await chatJSON(
+      [
+        { role: "system", content: CATEGORY_SYSTEM },
+        {
+          role: "user",
+          content: JSON.stringify({ category: name, message: sentence, existing_questions: existing.map((s) => ({ name: s.name, options: s.options.map((o) => o.label) })) }, null, 1)
+        }
+      ],
+      CATEGORY_SCHEMA,
+      { model: settings.questionModel, fallbacks: QUESTION_FALLBACK_LLMS, reasoning: "medium", maxTokens: 3e3, temperature: 0.5 }
+    );
+    const [spec] = normalizeQuestions([res], 1);
+    return { ...spec, id: `c${uid()}` };
+  },
   async classify(sentence, specs, model) {
     const questions = {};
     for (const spec of specs) {
@@ -1042,6 +1084,11 @@ var mockBackend = {
         options: ["definitely", "probably", "unsure", "unlikely", "never"].map((label) => ({ label, description: label }))
       }
     ]);
+  },
+  async proposeCategory(_sentence, name) {
+    await sleep(700);
+    const [spec] = normalizeQuestions([{ name, question: `What ${name.toLowerCase()} does the message express?`, kind: "scale", options: ["none", "low", "moderate", "high"].map((label) => ({ label, description: label })) }], 1);
+    return { ...spec, id: `c${uid()}` };
   },
   async designDataset(_description, questionCount) {
     await sleep(900);
@@ -1559,11 +1606,12 @@ function inlineInput(initial, onCommit, placeholder = "") {
   return input;
 }
 var Histogram = class {
-  constructor(spec, edit = null, expected, models = ["jev"]) {
+  constructor(spec, edit = null, expected, models = ["jev"], onRemove = null) {
     this.spec = spec;
     this.edit = edit;
     this.expected = expected;
     this.models = models;
+    this.onRemove = onRemove;
     this.el = h("section", { class: "hist" });
     this.render();
   }
@@ -1622,6 +1670,11 @@ var Histogram = class {
         });
         title.replaceChildren(input);
       });
+    }
+    if (this.onRemove) {
+      const remove = h("button", { class: "remove-question", text: "\xD7", attrs: { title: `Remove ${this.spec.name}`, "aria-label": `Remove category ${this.spec.name}` } });
+      remove.addEventListener("click", () => this.onRemove?.());
+      title.append(remove);
     }
     this.rows.clear();
     const rows = this.spec.options.map((option) => this.renderRow(option.label, option.description));
@@ -1699,16 +1752,71 @@ var Histogram = class {
 var ClassificationPanel = class {
   el = h("div", { class: "panel" });
   histograms = [];
+  addBtn = h("button", { class: "add-question", text: "+", attrs: { title: "Add a category", "aria-label": "Add a category" } });
+  adder = null;
+  pending = [];
+  onAdd = null;
+  onRemove = null;
+  constructor() {
+    this.addBtn.hidden = true;
+    this.addBtn.addEventListener("click", () => this.openAdder());
+  }
+  setHandlers(onAdd, onRemove) {
+    this.onAdd = onAdd;
+    this.onRemove = onRemove;
+  }
+  openAdder() {
+    if (this.adder) {
+      this.adder.querySelector("input")?.focus();
+      return;
+    }
+    const input = h("input", { class: "adder-input", attrs: { type: "text", placeholder: "New category, e.g. complaint type", spellcheck: "false", "aria-label": "New category name" } });
+    const close = () => {
+      this.adder?.remove();
+      this.adder = null;
+    };
+    input.addEventListener("keydown", (ev) => {
+      if (ev.key === "Escape") close();
+      if (ev.key !== "Enter") return;
+      ev.preventDefault();
+      const name = input.value.trim();
+      if (!name) return close();
+      close();
+      void this.add(name);
+    });
+    input.addEventListener("blur", () => {
+      if (!input.value.trim()) window.setTimeout(close, 120);
+    });
+    this.adder = h("div", { class: "adder" }, input, h("span", { class: "adder-hint", text: "Enter \u2014 the model writes the options" }));
+    this.el.prepend(this.adder);
+    input.focus();
+  }
+  async add(name) {
+    if (!this.onAdd) return;
+    const ghost = h("section", { class: "hist skeleton named" }, h("h3", { text: name }), h("div", { class: "hrows" }, ...Array.from({ length: 4 }, () => h("div", { class: "hrow" }, h("div", { class: "track" })))));
+    this.pending.push(ghost);
+    this.el.append(ghost);
+    try {
+      await this.onAdd(name);
+    } catch (err) {
+      toast(err instanceof Error ? err.message : String(err));
+    } finally {
+      ghost.remove();
+      this.pending = this.pending.filter((p) => p !== ghost);
+    }
+  }
   showSkeleton() {
     this.histograms = [];
     const block = () => h("section", { class: "hist skeleton" }, h("h3"), h("div", { class: "hrows" }, ...Array.from({ length: 4 }, () => h("div", { class: "hrow" }, h("div", { class: "track" })))));
     this.el.replaceChildren(...Array.from({ length: QUESTION_COUNT }, block));
   }
   setSpecs(specs, models, onEdit, expected) {
-    this.histograms = specs.map((spec) => new Histogram(spec, onEdit ?? null, expected?.[spec.id], models));
+    const removable = specs.length > 1 && this.onRemove;
+    this.histograms = specs.map((spec) => new Histogram(spec, onEdit ?? null, expected?.[spec.id], models, removable ? () => this.onRemove?.(spec.id) : null));
     this.el.classList.toggle("multi", models.length > 1);
     this.el.dataset.count = String(specs.length);
-    this.el.replaceChildren(...this.histograms.map((x) => x.el));
+    this.addBtn.hidden = !this.onAdd;
+    this.el.replaceChildren(this.addBtn, ...this.adder ? [this.adder] : [], ...this.histograms.map((x) => x.el), ...this.pending);
     this.el.classList.add("pending");
   }
   update(results, baselines) {
@@ -2348,6 +2456,10 @@ var SentenceCard = class {
       src.difficulty === "borderline" ? h("span", { class: "pill warn", text: "borderline", attrs: { title: src.note || "Could reasonably be labelled two ways" } }) : null
     ) : null;
     this.el = h("article", { class: "card" }, actions, meta, this.dial.el, this.statusEl, this.panel.el);
+    this.panel.setHandlers(
+      (name) => this.addQuestion(name),
+      (id) => this.removeQuestion(id)
+    );
     this.unsubscribe.push(
       attachDial(this.dial),
       this.dial.events.on("change", ({ text }) => {
@@ -2388,6 +2500,27 @@ var SentenceCard = class {
   }
   get specs() {
     return this.record.specs;
+  }
+  async addQuestion(name) {
+    const current = this.record.specs ?? [];
+    const spec = await this.deps.backend().proposeCategory(this.record.original, name, current);
+    const specs = [...this.record.specs ?? [], spec];
+    this.record.specs = specs;
+    this.record.baselines = {};
+    this.deps.onChange(this);
+    this.showSpecs(specs);
+    this.events.emit("specs", specs);
+    await this.rebaseline(specs);
+  }
+  removeQuestion(id) {
+    const specs = (this.record.specs ?? []).filter((s) => s.id !== id);
+    if (!specs.length) return;
+    this.record.specs = specs;
+    if (this.record.expected) delete this.record.expected[id];
+    this.deps.onChange(this);
+    this.showSpecs(specs);
+    this.events.emit("specs", specs);
+    void this.classify();
   }
   async modelsChanged() {
     const specs = this.record.specs;

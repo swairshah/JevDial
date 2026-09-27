@@ -53,7 +53,8 @@ export class Histogram {
     readonly spec: QuestionSpec,
     private readonly edit: SpecEditor | null = null,
     private readonly expected?: string,
-    private readonly models: S1Id[] = ['jev']
+    private readonly models: S1Id[] = ['jev'],
+    private readonly onRemove: (() => void) | null = null
   ) {
     this.el = h('section', { class: 'hist' });
     this.render();
@@ -113,6 +114,11 @@ export class Histogram {
         });
         title.replaceChildren(input);
       });
+    }
+    if (this.onRemove) {
+      const remove = h('button', { class: 'remove-question', text: '×', attrs: { title: `Remove ${this.spec.name}`, 'aria-label': `Remove category ${this.spec.name}` } });
+      remove.addEventListener('click', () => this.onRemove?.());
+      title.append(remove);
     }
     this.rows.clear();
     const rows = this.spec.options.map(option => this.renderRow(option.label, option.description));
