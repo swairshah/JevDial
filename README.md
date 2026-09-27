@@ -1,3 +1,5 @@
+![Word Dial interface](assets/word-dial.png)
+
 # Word Dial
 
 ## Run
