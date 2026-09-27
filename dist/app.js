@@ -8,6 +8,8 @@ var DEFAULT_QUESTION_LLM = "google/gemini-3.8-flash";
 var QUESTION_FALLBACK_LLMS = ["anthropic/claude-opus-5.5", DEFAULT_LLM];
 var QUESTION_LLM_CHOICES = [DEFAULT_QUESTION_LLM, "anthropic/claude-opus-5.5", DEFAULT_LLM];
 var DEFAULT_JEV = "jev-latest";
+var DEFAULT_KEV = "jaredpalmer/kev-4b";
+var OPENROUTER_SYSTEMONE_URL = "https://openrouter.ai/api/v1/systemone";
 var SEED_SENTENCE = "The food was good, but the service was pretty slow and our waiter seemed annoyed.";
 var MAX_STEPS = 8;
 var WHEEL_STEP_PX = 55;
@@ -126,6 +128,8 @@ var settings = {
   llmModel: DEFAULT_LLM,
   questionModel: DEFAULT_QUESTION_LLM,
   jevModel: DEFAULT_JEV,
+  kevModel: DEFAULT_KEV,
+  s1: ["jev"],
   jevEndpoint: "auto",
   haptics: true,
   sound: true,
@@ -139,6 +143,8 @@ function loadSettings() {
   const prefs = storage.getJSON("prefs", {});
   const { version, invert, remember, ...rest } = prefs;
   Object.assign(settings, rest);
+  settings.s1 = (Array.isArray(settings.s1) ? settings.s1 : []).filter((m) => m === "jev" || m === "kev");
+  if (!settings.s1.length) settings.s1 = ["jev"];
   if (invert !== void 0) settings.invertScroll = invert;
   if (remember !== void 0) settings.rememberKeys = remember;
   if ((version ?? 0) < PREFS_VERSION) settings.llmModel = DEFAULT_LLM;
@@ -433,41 +439,62 @@ function chatJSON(messages, schema, options = {}) {
   });
 }
 
-// src/services/jev.ts
-var hasJevAccess = () => !!settings.tsKey || proxy.hasJevKey;
-function endpoint() {
-  if (settings.jevEndpoint && settings.jevEndpoint !== "auto") return settings.jevEndpoint;
-  return proxy.available ? "/api/jev" : JEV_DIRECT_URL;
+// src/services/systemone.ts
+var S1_MODELS = {
+  jev: { label: "Jev", provider: "TypeSafe", batch: 60 },
+  kev: { label: "Kev", provider: "OpenRouter", batch: 24 }
+};
+var S1_ORDER = ["jev", "kev"];
+var activeModels = () => S1_ORDER.filter((m) => settings.s1.includes(m));
+var primaryModel = () => activeModels()[0] ?? "jev";
+function hasS1Access(model) {
+  if (model === "jev") return !!settings.tsKey || proxy.hasJevKey;
+  return !!settings.orKey || proxy.hasLlmKey;
+}
+function target(model) {
+  if (model === "jev") {
+    const custom = settings.jevEndpoint && settings.jevEndpoint !== "auto" ? settings.jevEndpoint : "";
+    return { url: custom || (proxy.available ? "/api/jev" : JEV_DIRECT_URL), key: settings.tsKey, model: settings.jevModel };
+  }
+  const useProxy = proxy.available && !settings.orKey;
+  return { url: useProxy ? "/api/kev" : OPENROUTER_SYSTEMONE_URL, key: settings.orKey, model: settings.kevModel };
 }
 var MAX_CONCURRENT = 4;
-var active2 = 0;
-var waiting2 = [];
-async function systemOne(state, questions) {
-  while (active2 >= MAX_CONCURRENT) await new Promise((resolve) => waiting2.push(resolve));
-  active2++;
+var active2 = { jev: 0, kev: 0 };
+var waiting2 = { jev: [], kev: [] };
+async function systemOne(model, state, questions) {
+  while (active2[model] >= MAX_CONCURRENT) await new Promise((resolve) => waiting2[model].push(resolve));
+  active2[model]++;
   try {
-    return await request(state, questions);
+    return await request(model, state, questions);
   } finally {
-    active2--;
-    waiting2.shift()?.();
+    active2[model]--;
+    waiting2[model].shift()?.();
   }
 }
-async function request(state, questions) {
+async function request(model, state, questions) {
+  const { url, key: key2, model: checkpoint } = target(model);
+  const name = S1_MODELS[model].label;
   const headers = { "Content-Type": "application/json", Accept: "application/json" };
-  if (settings.tsKey) headers.Authorization = `Bearer ${settings.tsKey}`;
-  let r;
-  try {
-    r = await fetch(endpoint(), { method: "POST", headers, body: JSON.stringify({ model: settings.jevModel, state, questions }) });
-  } catch {
-    throw new Error(proxy.available ? "Could not reach Jev through the local proxy" : "Browser could not reach Jev directly (CORS). Open the page from jev_proxy.py.");
+  if (key2) headers.Authorization = `Bearer ${key2}`;
+  let r = null;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      r = await fetch(url, { method: "POST", headers, body: JSON.stringify({ model: checkpoint, state, questions }) });
+    } catch {
+      throw new Error(proxy.available ? `Could not reach ${name} through the local proxy` : `Browser could not reach ${name} directly (CORS). Open the page from jev_proxy.py.`);
+    }
+    if (r.status !== 429 && r.status < 500) break;
+    await new Promise((res) => setTimeout(res, 500 * 2 ** attempt));
   }
-  if (!r.ok) throw new Error(`Jev ${r.status}: ${(await r.text()).slice(0, 180)}`);
+  if (r && r.status === 404 && url.startsWith("/api/")) throw new Error(`${name}: the running jev_proxy.py is an older version without this route. Stop it and start it again.`);
+  if (!r || !r.ok) throw new Error(`${name} ${r?.status ?? ""}: ${r ? (await r.text()).slice(0, 180) : "no response"}`);
   const data = await r.json();
   return data.answers ?? {};
 }
-async function systemOneBatched(state, questions, size = 40) {
+async function systemOneBatched(model, state, questions, size = S1_MODELS[model].batch) {
   const parts = chunk(Object.entries(questions), size);
-  const results = await Promise.all(parts.map((part) => systemOne(state, Object.fromEntries(part))));
+  const results = await Promise.all(parts.map((part) => systemOne(model, state, Object.fromEntries(part))));
   return Object.assign({}, ...results);
 }
 
@@ -674,7 +701,21 @@ function missingOptions(specs, items) {
 
 // src/backends/live.ts
 var key = (index) => `w${index}`;
-async function tagWithJev(sentence, words) {
+var levelScore = (a, levels) => {
+  if (!a) return null;
+  if (a.type === "score") return a.score;
+  if (a.type !== "choice") return null;
+  let s = 0;
+  let total = 0;
+  levels.forEach((l, i) => {
+    const p = a.probabilities?.[l] ?? 0;
+    s += i * p;
+    total += p;
+  });
+  return total > 0 ? s / total : null;
+};
+var levelCriteria = (levels) => Object.fromEntries(levels.map((l) => [l, null]));
+async function tagWithS1(model, sentence, words) {
   const state = { sentence, words: Object.fromEntries(words.map((w) => [key(w.index), w.text])) };
   const kindQuestions = {};
   for (const w of words) {
@@ -684,7 +725,7 @@ async function tagWithJev(sentence, words) {
       criteria: WORD_KIND_CRITERIA
     };
   }
-  const kinds = await systemOneBatched(state, kindQuestions);
+  const kinds = await systemOneBatched(model, state, kindQuestions);
   const flagged = [];
   for (const word of words) {
     const a = kinds[key(word.index)];
@@ -696,12 +737,11 @@ async function tagWithJev(sentence, words) {
   if (!flagged.length) return [];
   const scoreQuestions = {};
   for (const { word, kind } of flagged) {
-    scoreQuestions[key(word.index)] = kind === "degree" ? { type: "score", instructions: `How strong a degree does \`words.${key(word.index)}\` express as used in \`sentence\`?`, criteria: DEGREE_LEVELS } : { type: "score", instructions: `How negative or positive does \`words.${key(word.index)}\` read as used in \`sentence\`?`, criteria: VALENCE_LEVELS };
+    scoreQuestions[key(word.index)] = kind === "degree" ? { type: "choice", instructions: `How strong a degree does \`words.${key(word.index)}\` express as used in \`sentence\`?`, criteria: levelCriteria(DEGREE_LEVELS) } : { type: "choice", instructions: `How negative or positive does \`words.${key(word.index)}\` read as used in \`sentence\`?`, criteria: levelCriteria(VALENCE_LEVELS) };
   }
-  const scores = await systemOneBatched(state, scoreQuestions);
+  const scores = await systemOneBatched(model, state, scoreQuestions);
   return flagged.map(({ word, kind, confidence }) => {
-    const a = scores[key(word.index)];
-    const s = a?.type === "score" ? a.score : null;
+    const s = levelScore(scores[key(word.index)], kind === "degree" ? DEGREE_LEVELS : VALENCE_LEVELS);
     if (kind === "degree") return { index: word.index, kind, confidence, valence: 0, intensity: s === null ? 0.5 : s / 3 };
     return { index: word.index, kind, confidence, valence: s === null ? 0 : (s - 2) / 2, intensity: s === null ? 0.5 : Math.abs(s - 2) / 2 };
   });
@@ -724,11 +764,17 @@ async function tagWithLlm(sentence, words) {
     intensity: num(it.intensity, 0, 1, 0.5)
   }));
 }
+var criteriaOf = (spec) => Object.fromEntries(spec.options.map((o) => [o.label, o.description || null]));
+function distributionOf(spec, answer) {
+  const probs = answer?.type === "choice" ? answer.probabilities : answer?.type === "score" ? answer.probabilities : void 0;
+  return normalizeDistribution(spec, probs);
+}
 var liveBackend = {
   id: "live",
   async tagWords(sentence, words) {
+    const model = primaryModel();
     try {
-      return { tags: await tagWithJev(sentence, words), source: "Jev" };
+      return { tags: await tagWithS1(model, sentence, words), source: S1_MODELS[model].label };
     } catch (err) {
       if (!hasLlmAccess()) throw err;
       const tags = await tagWithLlm(sentence, words);
@@ -775,25 +821,28 @@ var liveBackend = {
     );
     return normalizeQuestions(res.questions);
   },
-  async classify(sentence, specs) {
+  async classify(sentence, specs, model) {
     const questions = {};
     for (const spec of specs) {
-      questions[spec.id] = {
-        type: "choice",
-        instructions: `${spec.question} Answer about \`sentence\`.`,
-        criteria: Object.fromEntries(spec.options.map((o) => [o.label, o.description || null]))
-      };
+      questions[spec.id] = { type: "choice", instructions: `${spec.question} Answer about \`sentence\`.`, criteria: criteriaOf(spec) };
     }
-    const answers = await systemOne({ sentence }, questions);
-    return Object.fromEntries(
-      specs.map((spec) => {
-        const a = answers[spec.id];
-        return [spec.id, normalizeDistribution(spec, a?.type === "choice" ? a.probabilities : a?.type === "score" ? a.probabilities : void 0)];
-      })
-    );
+    const answers = await systemOne(model, { sentence }, questions);
+    return Object.fromEntries(specs.map((spec) => [spec.id, distributionOf(spec, answers[spec.id])]));
   },
-  async classifyMany(sentences, specs) {
-    return Promise.all(sentences.map((sentence) => this.classify(sentence, specs)));
+  async classifyMany(sentences, specs, model) {
+    const state = { sentences: Object.fromEntries(sentences.map((s, i) => [`v${i}`, s])) };
+    const questions = {};
+    sentences.forEach((_, i) => {
+      for (const spec of specs) {
+        questions[`v${i}_${spec.id}`] = {
+          type: "choice",
+          instructions: `${spec.question} Answer about \`sentences.v${i}\` on its own; the other sentences are unrelated variants.`,
+          criteria: criteriaOf(spec)
+        };
+      }
+    });
+    const answers = await systemOneBatched(model, state, questions);
+    return sentences.map((_, i) => Object.fromEntries(specs.map((spec) => [spec.id, distributionOf(spec, answers[`v${i}_${spec.id}`])])));
   },
   async proposeSwaps(req) {
     const questions = req.specs.map((s) => ({ name: s.name, question: s.question, options: s.options.map((o) => o.label) }));
@@ -1002,8 +1051,8 @@ var mockBackend = {
     await sleep(1200);
     return mockItems(design, count);
   },
-  async classifyMany(sentences, specs) {
-    return Promise.all(sentences.map((sentence) => this.classify(sentence, specs)));
+  async classifyMany(sentences, specs, model) {
+    return Promise.all(sentences.map((s) => this.classify(s, specs, model)));
   },
   async proposeSwaps(req) {
     await sleep(500);
@@ -1011,15 +1060,17 @@ var mockBackend = {
     const pool = hit ? hit.scale.filter((w) => w !== req.word.toLowerCase()) : MOCK_SWAPS;
     return pool.slice(0, 10).map((text, i) => ({ text, kind: ["synonym", "stronger", "weaker", "opposite", "formal", "casual", "shift"][i % 7] }));
   },
-  async classify(sentence, specs) {
+  async classify(sentence, specs, model) {
     await sleep(250 + Math.random() * 200);
-    const v = sentenceValence(sentence);
+    const raw = sentenceValence(sentence);
+    const v = model === "kev" ? Math.max(-1, Math.min(1, raw * 0.6 - 0.15)) : raw;
+    const width = model === "kev" ? 1.6 : 0.9;
     return Object.fromEntries(
       specs.map((spec) => {
         const n = spec.options.length;
         const center = (1 - v) / 2 * (n - 1);
-        const raw = Object.fromEntries(spec.options.map((o, i) => [o.label, Math.exp(-((i - center) ** 2) / 0.9)]));
-        return [spec.id, normalizeDistribution(spec, raw)];
+        const raw2 = Object.fromEntries(spec.options.map((o, i) => [o.label, Math.exp(-((i - center) ** 2) / width)]));
+        return [spec.id, normalizeDistribution(spec, raw2)];
       })
     );
   }
@@ -1032,6 +1083,7 @@ var currentBackend = () => settings.mock ? mockBackend : liveBackend;
 var svg = (body) => `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${body}</svg>`;
 var icons = {
   close: svg('<path d="M18 6 6 18"/><path d="m6 6 12 12"/>'),
+  questions: svg('<path d="M7.9 20A9 9 0 1 0 4 16.1L2 22Z"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><path d="M12 17h.01"/>'),
   sparkle: svg('<path d="M12 3l1.8 5.2L19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8z"/><path d="M19 16l.7 2 2 .7-2 .7-.7 2-.7-2-2-.7 2-.7z"/>'),
   reset: svg('<path d="M3 12a9 9 0 1 0 3-6.7"/><path d="M3 4v5h5"/>'),
   settings: svg(
@@ -1043,6 +1095,38 @@ var icons = {
   moon: svg('<path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/>'),
   system: svg('<rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8"/><path d="M12 16v4"/>'),
   enter: svg('<path d="M9 10 4 15l5 5"/><path d="M20 4v7a4 4 0 0 1-4 4H4"/>')
+};
+
+// src/ui/Composer.ts
+var Composer = class {
+  el;
+  input;
+  constructor(onSubmit) {
+    this.input = h("textarea", { class: "composer-input", attrs: { rows: "1", placeholder: "Add a sentence\u2026", spellcheck: "true", "aria-label": "New sentence" } });
+    const submit = () => {
+      const text = this.input.value.replace(/\s+/g, " ").trim();
+      if (!text) return;
+      onSubmit(text);
+      this.input.value = "";
+      this.autosize();
+    };
+    this.input.addEventListener("keydown", (ev) => {
+      if (ev.key === "Enter" && !ev.shiftKey && !ev.isComposing) {
+        ev.preventDefault();
+        submit();
+      }
+    });
+    this.input.addEventListener("input", () => this.autosize());
+    const button = h("button", { class: "composer-go", html: icons.enter, attrs: { title: "Add (Enter)", "aria-label": "Add sentence" }, on: { click: submit } });
+    this.el = h("div", { class: "composer" }, this.input, button);
+  }
+  focus() {
+    this.input.focus();
+  }
+  autosize() {
+    this.input.style.height = "auto";
+    this.input.style.height = `${this.input.scrollHeight}px`;
+  }
 };
 
 // src/ui/toast.ts
@@ -1362,38 +1446,6 @@ var DatasetPage = class {
   }
 };
 
-// src/ui/Composer.ts
-var Composer = class {
-  el;
-  input;
-  constructor(onSubmit) {
-    this.input = h("textarea", { class: "composer-input", attrs: { rows: "1", placeholder: "Add a sentence\u2026", spellcheck: "true", "aria-label": "New sentence" } });
-    const submit = () => {
-      const text = this.input.value.replace(/\s+/g, " ").trim();
-      if (!text) return;
-      onSubmit(text);
-      this.input.value = "";
-      this.autosize();
-    };
-    this.input.addEventListener("keydown", (ev) => {
-      if (ev.key === "Enter" && !ev.shiftKey && !ev.isComposing) {
-        ev.preventDefault();
-        submit();
-      }
-    });
-    this.input.addEventListener("input", () => this.autosize());
-    const button = h("button", { class: "composer-go", html: icons.enter, attrs: { title: "Add (Enter)", "aria-label": "Add sentence" }, on: { click: submit } });
-    this.el = h("div", { class: "composer" }, this.input, button);
-  }
-  focus() {
-    this.input.focus();
-  }
-  autosize() {
-    this.input.style.height = "auto";
-    this.input.style.height = `${this.input.scrollHeight}px`;
-  }
-};
-
 // src/ui/theme.ts
 var THEME_ORDER = ["system", "light", "dark"];
 function applyTheme(mode) {
@@ -1416,11 +1468,12 @@ var Header = class {
   soundBtn;
   modePill;
   tabs = /* @__PURE__ */ new Map();
+  s1Buttons = /* @__PURE__ */ new Map();
   constructor(onOpenSettings) {
     this.themeBtn = h("button", { class: "icon-btn", on: { click: () => updateSettings({ theme: nextTheme(settings.theme) }) } });
     this.soundBtn = h("button", { class: "icon-btn", on: { click: () => updateSettings({ sound: !settings.sound }) } });
-    this.modePill = h("span", { class: "pill", text: "demo" });
     const gear = h("button", { class: "icon-btn", html: icons.settings, attrs: { title: "Settings", "aria-label": "Settings" }, on: { click: onOpenSettings } });
+    this.modePill = h("span", { class: "pill", text: "demo" });
     this.el = h(
       "header",
       { class: "topbar" },
@@ -1432,6 +1485,23 @@ var Header = class {
           const a = h("a", { text: r.label, attrs: { href: r.hash } });
           this.tabs.set(r.route, a);
           return a;
+        })
+      ),
+      h(
+        "div",
+        { class: "s1-toggle", attrs: { role: "group", "aria-label": "System-1 models" } },
+        ...S1_ORDER.map((m) => {
+          const b = h("button", { class: `s1-chip m-${m}`, attrs: { title: `${S1_MODELS[m].label} (${S1_MODELS[m].provider})` } }, h("i", { class: "mdot" }), S1_MODELS[m].label);
+          b.addEventListener("click", () => {
+            const on = settings.s1.includes(m);
+            if (on && settings.s1.length === 1) {
+              replay(b, "reject");
+              return;
+            }
+            updateSettings({ s1: on ? settings.s1.filter((x) => x !== m) : [...settings.s1, m] });
+          });
+          this.s1Buttons.set(m, b);
+          return b;
         })
       ),
       h("div", { class: "tools" }, this.themeBtn, this.soundBtn, gear)
@@ -1449,10 +1519,16 @@ var Header = class {
   sync() {
     this.themeBtn.innerHTML = THEME_ICON[settings.theme];
     this.themeBtn.title = THEME_LABEL[settings.theme];
+    this.themeBtn.setAttribute("aria-label", THEME_LABEL[settings.theme]);
     this.soundBtn.innerHTML = settings.sound ? icons.soundOn : icons.soundOff;
     this.soundBtn.title = settings.sound ? "Sound on" : "Sound off";
     this.soundBtn.classList.toggle("off", !settings.sound);
     this.modePill.hidden = !settings.mock;
+    for (const [m, b] of this.s1Buttons) {
+      const on = settings.s1.includes(m);
+      b.classList.toggle("on", on);
+      b.setAttribute("aria-pressed", String(on));
+    }
   }
 };
 
@@ -1483,29 +1559,51 @@ function inlineInput(initial, onCommit, placeholder = "") {
   return input;
 }
 var Histogram = class {
-  constructor(spec, edit = null, expected) {
+  constructor(spec, edit = null, expected, models = ["jev"]) {
     this.spec = spec;
     this.edit = edit;
     this.expected = expected;
+    this.models = models;
+    this.el = h("section", { class: "hist" });
     this.render();
   }
-  el = h("section", { class: "hist" });
+  el;
   rows = /* @__PURE__ */ new Map();
   last = null;
-  update(dist, baseline) {
-    this.last = { dist, baseline };
-    const top = topLabel(dist);
+  update(dists, baselines = {}) {
+    this.last = { dists, baselines };
+    const tops = /* @__PURE__ */ new Map();
+    for (const m of this.models) {
+      const d = dists[m];
+      if (d) tops.set(m, topLabel(d));
+    }
     for (const [label, row] of this.rows) {
-      const p = dist[label] ?? 0;
-      const b = baseline?.[label];
-      row.fill.style.width = `${(p * 100).toFixed(1)}%`;
-      row.pct.textContent = `${Math.round(p * 100)}%`;
-      row.root.classList.toggle("top", label === top);
-      const shift = b === void 0 ? 0 : Math.round((p - b) * 100);
-      row.ghost.style.left = `${((b ?? p) * 100).toFixed(1)}%`;
-      row.ghost.classList.toggle("show", shift !== 0);
-      row.delta.textContent = shift === 0 ? "" : `${shift > 0 ? "+" : "\u2212"}${Math.abs(shift)}`;
-      row.delta.className = `delta${shift > 0 ? " up" : shift < 0 ? " down" : ""}`;
+      let anyTop = false;
+      for (const m of this.models) {
+        const bar = row.bars[m];
+        const dist = dists[m];
+        if (!bar) continue;
+        const isTop = tops.get(m) === label;
+        anyTop ||= isTop;
+        row.root.classList.toggle(`top-${m}`, isTop);
+        if (!dist) {
+          bar.fill.style.width = "0%";
+          bar.pct.textContent = "\u2013";
+          bar.delta.textContent = "";
+          bar.ghost.classList.remove("show");
+          continue;
+        }
+        const p = dist[label] ?? 0;
+        const b = baselines[m]?.[label];
+        bar.fill.style.width = `${(p * 100).toFixed(1)}%`;
+        bar.pct.textContent = this.models.length > 1 ? String(Math.round(p * 100)) : `${Math.round(p * 100)}%`;
+        const shift = b === void 0 ? 0 : Math.round((p - b) * 100);
+        bar.ghost.style.left = `${((b ?? p) * 100).toFixed(1)}%`;
+        bar.ghost.classList.toggle("show", shift !== 0);
+        bar.delta.textContent = shift === 0 ? "" : `${shift > 0 ? "+" : "\u2212"}${Math.abs(shift)}`;
+        bar.delta.className = `delta${shift > 0 ? " up" : shift < 0 ? " down" : ""}`;
+      }
+      row.root.classList.toggle("top", anyTop);
     }
   }
   commit(next) {
@@ -1548,15 +1646,23 @@ var Histogram = class {
       children.push(add);
     }
     this.el.replaceChildren(...children);
-    if (this.last) this.update(this.last.dist, this.last.baseline);
+    if (this.last) this.update(this.last.dists, this.last.baselines);
   }
   renderRow(label, description) {
-    const fill = h("div", { class: "fill" });
-    const ghost = h("div", { class: "ghost" });
-    const pct = h("span", { class: "pct", text: "\u2013" });
-    const delta = h("span", { class: "delta" });
+    const bars = {};
+    const tracks = h("div", { class: "tracks" });
+    const values = h("div", { class: "hvals" });
+    for (const m of this.models) {
+      const fill = h("div", { class: "fill" });
+      const ghost = h("div", { class: "ghost" });
+      const pct = h("span", { class: "pct", text: "\u2013" });
+      const delta = h("span", { class: "delta" });
+      tracks.append(h("div", { class: `track m-${m}` }, fill, ghost));
+      values.append(h("span", { class: `hval m-${m}` }, pct, delta));
+      bars[m] = { fill, ghost, pct, delta };
+    }
     const labelEl = h("span", { class: "hlabel", text: label, attrs: { title: description ? `${label}: ${description}` : label } });
-    const parts = [labelEl, h("div", { class: "track" }, fill, ghost), h("span", { class: "hval" }, pct, delta)];
+    const parts = [labelEl, tracks, values];
     if (this.edit) {
       labelEl.classList.add("editable");
       labelEl.addEventListener("click", () => {
@@ -1575,9 +1681,9 @@ var Histogram = class {
       remove.addEventListener("click", () => this.remove(label));
       parts.push(remove);
     }
-    const root = h("div", { class: `hrow${label === this.expected ? " expected" : ""}` }, ...parts);
+    const root = h("div", { class: `hrow${label === this.expected ? " expected" : ""}${this.models.length > 1 ? " multi" : ""}` }, ...parts);
     if (label === this.expected) labelEl.title = `Intended label in the dataset${description ? ` \u2014 ${description}` : ""}`;
-    this.rows.set(label, { root, fill, ghost, pct, delta });
+    this.rows.set(label, { root, bars });
     return root;
   }
   remove(label) {
@@ -1598,15 +1704,18 @@ var ClassificationPanel = class {
     const block = () => h("section", { class: "hist skeleton" }, h("h3"), h("div", { class: "hrows" }, ...Array.from({ length: 4 }, () => h("div", { class: "hrow" }, h("div", { class: "track" })))));
     this.el.replaceChildren(...Array.from({ length: QUESTION_COUNT }, block));
   }
-  setSpecs(specs, onEdit, expected) {
-    this.histograms = specs.map((spec) => new Histogram(spec, onEdit ?? null, expected?.[spec.id]));
+  setSpecs(specs, models, onEdit, expected) {
+    this.histograms = specs.map((spec) => new Histogram(spec, onEdit ?? null, expected?.[spec.id], models));
+    this.el.classList.toggle("multi", models.length > 1);
+    this.el.dataset.count = String(specs.length);
     this.el.replaceChildren(...this.histograms.map((x) => x.el));
     this.el.classList.add("pending");
   }
-  update(result, baseline) {
+  update(results, baselines) {
     for (const hist of this.histograms) {
-      const dist = result[hist.spec.id];
-      if (dist) hist.update(dist, baseline?.[hist.spec.id]);
+      const id = hist.spec.id;
+      const pick = (src) => Object.fromEntries(Object.entries(src).flatMap(([m, c]) => c?.[id] ? [[m, c[id]]] : []));
+      hist.update(pick(results), pick(baselines));
     }
     this.el.classList.remove("pending");
   }
@@ -1749,9 +1858,9 @@ var pitchOf = (t, r = rungOf(t)) => t.kind === "degree" ? r.intensity * 2 - 1 : 
 
 // src/dial/DialSentence.ts
 var registry = /* @__PURE__ */ new WeakMap();
-function locateToken(target) {
-  if (!(target instanceof Element)) return null;
-  const tokEl = target.closest(".tok.dial");
+function locateToken(target2) {
+  if (!(target2 instanceof Element)) return null;
+  const tokEl = target2.closest(".tok.dial");
   const root = tokEl?.closest(".dial-sentence");
   const dial = root && registry.get(root);
   if (!tokEl || !dial) return null;
@@ -1867,9 +1976,9 @@ var DialSentence = class {
       feedback("limit", t.el, dir);
       return;
     }
-    const target = t.level + dir;
-    if (t.ladder.has(target)) {
-      this.setLevel(t, target, dir, "dial");
+    const target2 = t.level + dir;
+    if (t.ladder.has(target2)) {
+      this.setLevel(t, target2, dir, "dial");
       this.prefetch(t, dir);
       return;
     }
@@ -1879,7 +1988,7 @@ var DialSentence = class {
       const rung = await this.fetchRung(t, t.level, dir);
       if (!this.alive(t)) return;
       if (rung) {
-        this.setLevel(t, target, dir, "dial");
+        this.setLevel(t, target2, dir, "dial");
         this.prefetch(t, dir);
       } else feedback("limit", t.el, dir);
     } catch (err) {
@@ -1906,10 +2015,10 @@ var DialSentence = class {
     this.events.emit("status", { kind, text });
   }
   fetchRung(t, from, dir) {
-    const target = from + dir;
-    const existing = t.ladder.get(target);
+    const target2 = from + dir;
+    const existing = t.ladder.get(target2);
     if (existing) return Promise.resolve(existing);
-    const key2 = `${this.generation}:${t.i}:${target}`;
+    const key2 = `${this.generation}:${t.i}:${target2}`;
     const pending = this.inflight.get(key2);
     if (pending) return pending;
     const current = rungOf(t, from).text;
@@ -1932,7 +2041,7 @@ var DialSentence = class {
         return null;
       }
       const rung = { text, valence: num(res.valence, -1, 1, rungOf(t, from).valence), intensity: num(res.intensity, 0, 1, 0.5) };
-      t.ladder.set(target, rung);
+      t.ladder.set(target2, rung);
       this.events.emit("ladder", t);
       return rung;
     }).catch((err) => {
@@ -2083,9 +2192,9 @@ var Ladder = class {
     return h("div", { class: "edge", text: `${dir > 0 ? "\u2191" : "\u2193"} ${word}` });
   }
   render() {
-    const target = this.target;
-    if (!target?.tok.el?.isConnected) return;
-    const { dial, tok } = target;
+    const target2 = this.target;
+    if (!target2?.tok.el?.isConnected) return;
+    const { dial, tok } = target2;
     const levels = [...tok.ladder.keys()].sort((a, b) => b - a).filter((l) => Math.abs(l - tok.level) <= WINDOW);
     const rows = levels.map((level) => {
       const rung = tok.ladder.get(level);
@@ -2121,24 +2230,24 @@ function installDialInteractions() {
     "wheel",
     (ev) => {
       const now = performance.now();
-      let target = locateToken(ev.target);
-      if (!target && wheelTarget && wheelTarget.dial.alive(wheelTarget.tok) && now - wheelLast < WHEEL_STICKY_MS) target = wheelTarget;
-      if (!target) return;
+      let target2 = locateToken(ev.target);
+      if (!target2 && wheelTarget && wheelTarget.dial.alive(wheelTarget.tok) && now - wheelLast < WHEEL_STICKY_MS) target2 = wheelTarget;
+      if (!target2) return;
       ev.preventDefault();
       wheelLast = now;
-      if (wheelTarget?.tok !== target.tok) wheelAcc = 0;
-      wheelTarget = target;
+      if (wheelTarget?.tok !== target2.tok) wheelAcc = 0;
+      wheelTarget = target2;
       window.clearTimeout(wheelIdle);
       wheelIdle = window.setTimeout(() => wheelAcc = 0, 260);
       const unit = ev.deltaMode === 1 ? 40 : ev.deltaMode === 2 ? 400 : 1;
       const dy = -ev.deltaY * unit * (settings.invertScroll ? -1 : 1);
-      if (now < target.tok.coolUntil) return;
+      if (now < target2.tok.coolUntil) return;
       wheelAcc += dy;
       if (Math.abs(wheelAcc) < WHEEL_STEP_PX) return;
       const dir = Math.sign(wheelAcc);
       wheelAcc = 0;
-      target.tok.coolUntil = now + 150;
-      void target.dial.go(target.tok, dir);
+      target2.tok.coolUntil = now + 150;
+      void target2.dial.go(target2.tok, dir);
     },
     { passive: false }
   );
@@ -2221,11 +2330,13 @@ var SentenceCard = class {
   constructor(record, deps) {
     this.record = record;
     this.deps = deps;
+    if (!record.baselines) record.baselines = record.baseline ? { jev: record.baseline } : {};
+    delete record.baseline;
     this.dial = new DialSentence(record.text, deps.backend);
     const actions = h(
       "div",
       { class: "card-actions" },
-      h("button", { class: "icon-btn sm", html: icons.sparkle, attrs: { title: "New questions", "aria-label": "New questions" }, on: { click: () => void this.regenerateQuestions() } }),
+      h("button", { class: "icon-btn sm", html: icons.questions, attrs: { title: "New questions", "aria-label": "New questions" }, on: { click: () => void this.regenerateQuestions() } }),
       h("button", { class: "icon-btn sm", html: icons.reset, attrs: { title: "Reset to original", "aria-label": "Reset" }, on: { click: () => this.resetToOriginal() } }),
       h("button", { class: "icon-btn sm", html: icons.close, attrs: { title: "Remove", "aria-label": "Remove" }, on: { click: () => this.deps.onRemove(this) } })
     );
@@ -2270,24 +2381,47 @@ var SentenceCard = class {
     if (this.questionsPromise) return;
     this.classifySeq++;
     this.record.specs = null;
-    this.record.baseline = null;
+    this.record.baselines = {};
     this.deps.onChange(this);
     const specs = await this.prepareQuestions();
-    if (!specs) return;
-    if (this.dial.text !== this.record.original) {
-      const seq = ++this.classifySeq;
-      try {
-        const baseline = await this.deps.backend().classify(this.record.original, specs);
-        if (seq !== this.classifySeq) return;
-        this.record.baseline = baseline;
-        this.deps.onChange(this);
-      } catch {
-      }
-    }
-    await this.classify();
+    if (specs) await this.rebaseline(specs);
   }
   get specs() {
     return this.record.specs;
+  }
+  async modelsChanged() {
+    const specs = this.record.specs;
+    if (!specs) return;
+    this.showSpecs(specs);
+    await this.rebaseline(specs, true);
+  }
+  get baselines() {
+    return this.record.baselines ??= {};
+  }
+  showSpecs(specs) {
+    this.panel.setSpecs(specs, activeModels(), (n) => this.editSpec(n), this.record.expected);
+  }
+  editSpec(next) {
+    const specs = (this.record.specs ?? []).map((s) => s.id === next.id ? next : s);
+    this.record.specs = specs;
+    this.record.baselines = {};
+    this.deps.onChange(this);
+    this.showSpecs(specs);
+    this.events.emit("specs", specs);
+    void this.rebaseline(specs);
+  }
+  async rebaseline(specs, onlyMissing = false) {
+    if (this.dial.text !== this.record.original) {
+      const seq = ++this.classifySeq;
+      const models = activeModels().filter((m) => !onlyMissing || !this.baselines[m]);
+      const results = await Promise.allSettled(models.map((m) => this.deps.backend().classify(this.record.original, specs, m)));
+      if (seq !== this.classifySeq) return;
+      results.forEach((res, i) => {
+        if (res.status === "fulfilled") this.baselines[models[i]] = res.value;
+      });
+      this.deps.onChange(this);
+    }
+    await this.classify();
   }
   resetToOriginal() {
     this.dial.resetAll();
@@ -2300,31 +2434,6 @@ var SentenceCard = class {
     for (const off of this.unsubscribe) off();
     this.dial.events.clear();
     this.events.clear();
-  }
-  showSpecs(specs) {
-    this.panel.setSpecs(specs, (next) => this.editSpec(next), this.record.expected);
-  }
-  editSpec(next) {
-    const specs = (this.record.specs ?? []).map((s) => s.id === next.id ? next : s);
-    this.record.specs = specs;
-    this.record.baseline = null;
-    this.deps.onChange(this);
-    this.showSpecs(specs);
-    this.events.emit("specs", specs);
-    void this.regenerateBaseline(specs);
-  }
-  async regenerateBaseline(specs) {
-    if (this.dial.text !== this.record.original) {
-      const seq = ++this.classifySeq;
-      try {
-        const baseline = await this.deps.backend().classify(this.record.original, specs);
-        if (seq !== this.classifySeq) return;
-        this.record.baseline = baseline;
-        this.deps.onChange(this);
-      } catch {
-      }
-    }
-    await this.classify();
   }
   prepareQuestions() {
     if (this.record.specs) {
@@ -2352,21 +2461,24 @@ var SentenceCard = class {
     if (!specs) return;
     const seq = ++this.classifySeq;
     const text = this.dial.text;
+    const models = activeModels();
     this.panel.setBusy(true);
-    try {
-      const result = await this.deps.backend().classify(text, specs);
-      if (seq !== this.classifySeq) return;
-      if (!this.record.baseline && text === this.record.original) {
-        this.record.baseline = result;
-        this.deps.onChange(this);
-      }
-      this.panel.clearError();
-      this.panel.update(result, this.record.baseline);
-    } catch (err) {
-      if (seq === this.classifySeq) this.panel.showError(errorMessage(err), () => void this.classify());
-    } finally {
-      if (seq === this.classifySeq) this.panel.setBusy(false);
-    }
+    const settled = await Promise.allSettled(models.map((m) => this.deps.backend().classify(text, specs, m)));
+    if (seq !== this.classifySeq) return;
+    const results = {};
+    const errors = [];
+    settled.forEach((res, i) => {
+      const m = models[i];
+      if (res.status === "fulfilled") {
+        results[m] = res.value;
+        if (!this.baselines[m] && text === this.record.original) this.baselines[m] = res.value;
+      } else errors.push(errorMessage(res.reason));
+    });
+    if (text === this.record.original) this.deps.onChange(this);
+    this.panel.clearError();
+    this.panel.update(results, this.baselines);
+    if (errors.length) this.panel.showError(errors.join(" \xB7 "), () => void this.classify());
+    this.panel.setBusy(false);
   }
   setStatus(text, error) {
     this.statusEl.textContent = text;
@@ -2381,7 +2493,8 @@ var TEXT_FIELDS = [
   { key: "tsKey", label: "TypeSafe API key", secret: true },
   { key: "llmModel", label: "Word model", list: LLM_CHOICES },
   { key: "questionModel", label: "Question model", list: QUESTION_LLM_CHOICES },
-  { key: "jevModel", label: "Jev model" },
+  { key: "jevModel", label: "Jev checkpoint" },
+  { key: "kevModel", label: "Kev checkpoint" },
   { key: "jevEndpoint", label: "Jev endpoint" }
 ];
 var TOGGLES = [
@@ -2403,7 +2516,7 @@ var SettingsDialog = class {
       this.inputs.set(f.key, input);
       const list = f.list ? h("datalist", { attrs: { id: `${id}-list` } }, ...f.list.map((v) => h("option", { attrs: { value: v } }))) : null;
       if (list) input.setAttribute("list", `${id}-list`);
-      return h("div", { class: `field${f.key === "llmModel" || f.key === "questionModel" ? " half" : ""}` }, h("label", { text: f.label, attrs: { for: id } }), input, list);
+      return h("div", { class: `field${["llmModel", "questionModel", "jevModel", "kevModel"].includes(f.key) ? " half" : ""}` }, h("label", { text: f.label, attrs: { for: id } }), input, list);
     });
     const toggles = TOGGLES.map((t) => {
       const input = h("input", { attrs: { type: "checkbox" } });
@@ -2439,6 +2552,7 @@ var SettingsDialog = class {
     patch.llmModel ||= settings.llmModel;
     patch.questionModel ||= settings.questionModel;
     patch.jevModel ||= settings.jevModel;
+    patch.kevModel ||= settings.kevModel;
     patch.jevEndpoint ||= "auto";
     updateSettings(patch);
   }
@@ -2614,21 +2728,26 @@ var SwapPanel = class {
       this.setStatus("Waiting for this card\u2019s questions\u2026");
       return;
     }
-    this.setStatus(`Classifying ${indices.length} variant${indices.length > 1 ? "s" : ""}\u2026`);
+    const models = activeModels();
+    this.setStatus(`Classifying ${indices.length} variant${indices.length > 1 ? "s" : ""} with ${models.map((m) => S1_MODELS[m].label).join(" and ")}\u2026`);
     const sentences = indices.map((i) => card.dial.withReplacement(this.index, this.variants[i].text));
-    try {
-      const results = await this.deps.backend().classifyMany(sentences, specs);
-      if (seq !== this.seq) return;
+    const settled = await Promise.allSettled(models.map((m) => this.deps.backend().classifyMany(sentences, specs, m)));
+    if (seq !== this.seq) return;
+    const errors = [];
+    settled.forEach((res, mi) => {
+      const m = models[mi];
+      if (res.status === "rejected") {
+        errors.push(errorMessage(res.reason));
+        return;
+      }
       indices.forEach((vi, k) => {
-        this.variants[vi].result = results[k] ?? null;
-        this.variants[vi].error = !results[k];
+        const v = this.variants[vi];
+        const c = res.value[k];
+        if (c) v.result = { ...v.result ?? {}, [m]: c };
       });
-      this.setStatus("");
-    } catch (err) {
-      if (seq !== this.seq) return;
-      for (const vi of indices) this.variants[vi].error = true;
-      this.setStatus(errorMessage(err));
-    }
+    });
+    for (const vi of indices) this.variants[vi].error = !this.variants[vi].result;
+    this.setStatus(errors.join(" \xB7 "));
     this.renderBody();
   }
   modelsChanged() {
@@ -2658,28 +2777,33 @@ var SwapPanel = class {
     this.renderBody();
     this.showPreview(null);
   }
-  flips(v) {
-    const base = this.base?.result;
-    const res = v.result;
+  flipsFor(v, m) {
+    const base = this.base?.result?.[m];
+    const res = v.result?.[m];
     if (!base || !res) return 0;
     let n = 0;
-    for (const spec of this.specs) {
-      const b = base[spec.id];
-      const r = res[spec.id];
+    for (const s of this.specs) {
+      const b = base[s.id];
+      const r = res[s.id];
       if (b && r && topLabel(r) !== topLabel(b)) n++;
     }
     return n;
   }
+  flips(v) {
+    return activeModels().reduce((n, m) => n + this.flipsFor(v, m), 0);
+  }
   shift(v) {
-    const base = this.base?.result;
-    const res = v.result;
-    if (!base || !res) return 0;
     let total = 0;
-    for (const spec of this.specs) {
-      const b = base[spec.id];
-      const r = res[spec.id];
-      if (!b || !r) continue;
-      for (const label of Object.keys(b)) total += Math.abs((r[label] ?? 0) - b[label]);
+    for (const m of activeModels()) {
+      const base = this.base?.result?.[m];
+      const res = v.result?.[m];
+      if (!base || !res) continue;
+      for (const s of this.specs) {
+        const b = base[s.id];
+        const r = res[s.id];
+        if (!b || !r) continue;
+        for (const label of Object.keys(b)) total += Math.abs((r[label] ?? 0) - b[label]);
+      }
     }
     return total;
   }
@@ -2736,9 +2860,13 @@ var SwapPanel = class {
     if (this.status) {
       this.infoEl.textContent = this.status;
     } else if (done.length) {
-      const flipped = done.filter((v) => this.flips(v) > 0).length;
-      if (flipped) this.infoEl.classList.add("flipped");
-      this.infoEl.append(h("b", { text: `${flipped} of ${done.length}` }), " replacements flip at least one answer");
+      const models = activeModels();
+      const parts = models.map((m) => {
+        const flipped = done.filter((v) => this.flipsFor(v, m) > 0).length;
+        if (flipped) this.infoEl.classList.add("flipped");
+        return h("span", { class: `swap-info-m m-${m}` }, models.length > 1 ? h("i", { class: "mdot" }) : null, models.length > 1 ? `${S1_MODELS[m].label} ` : "", h("b", { text: `${flipped} of ${done.length}` }));
+      });
+      this.infoEl.append(...parts, " replacements flip at least one answer");
     }
   }
   renderHead(specs) {
@@ -2761,22 +2889,39 @@ var SwapPanel = class {
     const isBase = i === this.baseIdx;
     const tag = isBase ? "current" : KIND_LABEL[v.kind];
     const nameCell = h("td", { class: "swap-name" }, h("div", { class: "swap-text", text: v.text }), h("div", { class: `kind kind-${isBase ? "current" : v.kind}`, text: tag }));
-    const cells = specs.map((spec) => {
-      const dist = v.result?.[spec.id];
-      if (!dist) return h("td", { class: `swap-cell${v.error ? " err" : " wait"}` }, h("div", { class: "shimmer" }), h("div", { class: "shimmer short" }));
-      const top = topLabel(dist);
-      const b = base?.[spec.id];
-      const baseTop = b ? topLabel(b) : top;
-      const flip = !isBase && top !== baseTop;
-      const p = Math.round((dist[top] ?? 0) * 100);
-      const drift = !isBase && !flip && b ? Math.round(((dist[baseTop] ?? 0) - (b[baseTop] ?? 0)) * 100) : 0;
-      const title = Object.entries(dist).map(([label, q]) => `${label} ${Math.round(q * 100)}%`).join(", ");
-      return h(
-        "td",
-        { class: `swap-cell${flip ? " flip" : ""}`, attrs: { title } },
-        h("span", { class: "cl", text: top }),
-        h("span", { class: "cn" }, h("span", { class: "cp", text: `${p}%` }), drift ? h("span", { class: `cd ${drift > 0 ? "up" : "down"}`, text: `${drift > 0 ? "+" : "\u2212"}${Math.abs(drift)}` }) : null)
-      );
+    const models = activeModels();
+    const cells = specs.map((s) => {
+      const lines = [];
+      let anyFlip = false;
+      let waiting3 = false;
+      const titles = [];
+      for (const m of models) {
+        const dist = v.result?.[m]?.[s.id];
+        if (!dist) {
+          waiting3 = true;
+          continue;
+        }
+        const top = topLabel(dist);
+        const b = base?.[m]?.[s.id];
+        const baseTop = b ? topLabel(b) : top;
+        const flip = !isBase && top !== baseTop;
+        anyFlip ||= flip;
+        const p = Math.round((dist[top] ?? 0) * 100);
+        const drift = models.length === 1 && !isBase && !flip && b ? Math.round(((dist[baseTop] ?? 0) - (b[baseTop] ?? 0)) * 100) : 0;
+        titles.push(`${S1_MODELS[m].label}: ${Object.entries(dist).map(([l, q]) => `${l} ${Math.round(q * 100)}%`).join(", ")}`);
+        lines.push(
+          h(
+            "div",
+            { class: `cline m-${m}${flip ? " flip" : ""}` },
+            models.length > 1 ? h("i", { class: "mdot" }) : null,
+            h("span", { class: "cl", text: top }),
+            h("span", { class: "cn" }, h("span", { class: "cp", text: `${p}%` }), drift ? h("span", { class: `cd ${drift > 0 ? "up" : "down"}`, text: `${drift > 0 ? "+" : "\u2212"}${Math.abs(drift)}` }) : null)
+          )
+        );
+      }
+      if (!lines.length) return h("td", { class: `swap-cell${v.error ? " err" : " wait"}` }, h("div", { class: "shimmer" }), h("div", { class: "shimmer short" }));
+      if (waiting3) lines.push(h("div", { class: "shimmer short" }));
+      return h("td", { class: `swap-cell${anyFlip ? " flip" : ""}${models.length > 1 ? " multi" : ""}`, attrs: { title: titles.join("\n") } }, ...lines);
     });
     const row = h("tr", { class: isBase ? "base" : "" }, nameCell, ...cells);
     if (!isBase) {
@@ -2825,11 +2970,14 @@ var App = class {
     });
     settingsEvents.on("change", ({ previous }) => {
       applyTheme(settings.theme);
-      const backendChanged = previous.mock !== settings.mock || previous.llmModel !== settings.llmModel || previous.jevModel !== settings.jevModel || previous.jevEndpoint !== settings.jevEndpoint;
+      const backendChanged = previous.mock !== settings.mock || previous.llmModel !== settings.llmModel || previous.jevModel !== settings.jevModel || previous.kevModel !== settings.kevModel || previous.jevEndpoint !== settings.jevEndpoint;
       const keysAdded = !previous.orKey && !!settings.orKey || !previous.tsKey && !!settings.tsKey;
       if (backendChanged || keysAdded) {
         this.swap.close();
         for (const card of this.cards) void card.restart();
+      } else if (previous.s1.join() !== settings.s1.join()) {
+        for (const card of this.cards) void card.modelsChanged();
+        this.swap.modelsChanged();
       }
     });
     const stored = storage.getJSON(STORE_KEY, []);
@@ -2854,7 +3002,7 @@ var App = class {
           original: item.text,
           text: item.text,
           specs: ds.specs.map((s) => ({ ...s, options: s.options.map((o) => ({ ...o })) })),
-          baseline: null,
+          baselines: {},
           expected: item.labels,
           source: { dataset: ds.title, difficulty: item.difficulty, note: item.note }
         },
@@ -2869,7 +3017,7 @@ var App = class {
     this.settingsDialog.open();
   }
   add(text) {
-    this.mount({ id: uid(), original: text, text, specs: null, baseline: null }, true);
+    this.mount({ id: uid(), original: text, text, specs: null, baselines: {} }, true);
     this.persist();
   }
   mount(record, animate) {
@@ -2920,7 +3068,7 @@ async function main() {
   const root = document.getElementById("app");
   if (!root) throw new Error("#app not found");
   const app = new App(root);
-  if (!settings.mock && !hasLlmAccess() && !hasJevAccess()) app.openSettings();
+  if (!settings.mock && !hasLlmAccess() && !activeModels().some(hasS1Access)) app.openSettings();
 }
 void main();
 //# sourceMappingURL=app.js.map

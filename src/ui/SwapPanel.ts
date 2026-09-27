@@ -1,5 +1,6 @@
 import { topLabel } from '../analysis/questions';
-import type { Backend, Classification, Distribution, QuestionSpec, SwapKind } from '../types';
+import { activeModels, S1_MODELS } from '../services/systemone';
+import type { Backend, Distribution, MultiClassification, QuestionSpec, S1Id, SwapKind } from '../types';
 import { errorMessage, h } from '../util';
 import { icons } from './icons';
 import type { SentenceCard } from './SentenceCard';
@@ -9,7 +10,7 @@ type SortMode = 'kind' | 'flips';
 interface Variant {
   text: string;
   kind: SwapKind | 'original';
-  result: Classification | null;
+  result: MultiClassification | null;
   error?: boolean;
 }
 
@@ -200,21 +201,26 @@ export class SwapPanel {
       this.setStatus('Waiting for this card’s questions…');
       return;
     }
-    this.setStatus(`Classifying ${indices.length} variant${indices.length > 1 ? 's' : ''}…`);
+    const models = activeModels();
+    this.setStatus(`Classifying ${indices.length} variant${indices.length > 1 ? 's' : ''} with ${models.map(m => S1_MODELS[m].label).join(' and ')}…`);
     const sentences = indices.map(i => card.dial.withReplacement(this.index, this.variants[i].text));
-    try {
-      const results = await this.deps.backend().classifyMany(sentences, specs);
-      if (seq !== this.seq) return;
+    const settled = await Promise.allSettled(models.map(m => this.deps.backend().classifyMany(sentences, specs, m)));
+    if (seq !== this.seq) return;
+    const errors: string[] = [];
+    settled.forEach((res, mi) => {
+      const m = models[mi];
+      if (res.status === 'rejected') {
+        errors.push(errorMessage(res.reason));
+        return;
+      }
       indices.forEach((vi, k) => {
-        this.variants[vi].result = results[k] ?? null;
-        this.variants[vi].error = !results[k];
+        const v = this.variants[vi];
+        const c = res.value[k];
+        if (c) v.result = { ...(v.result ?? {}), [m]: c };
       });
-      this.setStatus('');
-    } catch (err) {
-      if (seq !== this.seq) return;
-      for (const vi of indices) this.variants[vi].error = true;
-      this.setStatus(errorMessage(err));
-    }
+    });
+    for (const vi of indices) this.variants[vi].error = !this.variants[vi].result;
+    this.setStatus(errors.join(' · '));
     this.renderBody();
   }
 
@@ -248,29 +254,35 @@ export class SwapPanel {
     this.showPreview(null);
   }
 
-  private flips(v: Variant): number {
-    const base = this.base?.result;
-    const res = v.result;
+  private flipsFor(v: Variant, m: S1Id): number {
+    const base = this.base?.result?.[m];
+    const res = v.result?.[m];
     if (!base || !res) return 0;
     let n = 0;
-    for (const spec of this.specs) {
-      const b = base[spec.id];
-      const r = res[spec.id];
+    for (const s of this.specs) {
+      const b = base[s.id];
+      const r = res[s.id];
       if (b && r && topLabel(r) !== topLabel(b)) n++;
     }
     return n;
   }
 
+  private flips(v: Variant): number {
+    return activeModels().reduce((n, m) => n + this.flipsFor(v, m), 0);
+  }
+
   private shift(v: Variant): number {
-    const base = this.base?.result;
-    const res = v.result;
-    if (!base || !res) return 0;
     let total = 0;
-    for (const spec of this.specs) {
-      const b = base[spec.id];
-      const r = res[spec.id];
-      if (!b || !r) continue;
-      for (const label of Object.keys(b)) total += Math.abs((r[label] ?? 0) - b[label]);
+    for (const m of activeModels()) {
+      const base = this.base?.result?.[m];
+      const res = v.result?.[m];
+      if (!base || !res) continue;
+      for (const s of this.specs) {
+        const b = base[s.id];
+        const r = res[s.id];
+        if (!b || !r) continue;
+        for (const label of Object.keys(b)) total += Math.abs((r[label] ?? 0) - b[label]);
+      }
     }
     return total;
   }
@@ -334,9 +346,13 @@ export class SwapPanel {
     if (this.status) {
       this.infoEl.textContent = this.status;
     } else if (done.length) {
-      const flipped = done.filter(v => this.flips(v) > 0).length;
-      if (flipped) this.infoEl.classList.add('flipped');
-      this.infoEl.append(h('b', { text: `${flipped} of ${done.length}` }), ' replacements flip at least one answer');
+      const models = activeModels();
+      const parts = models.map(m => {
+        const flipped = done.filter(v => this.flipsFor(v, m) > 0).length;
+        if (flipped) this.infoEl.classList.add('flipped');
+        return h('span', { class: `swap-info-m m-${m}` }, models.length > 1 ? h('i', { class: 'mdot' }) : null, models.length > 1 ? `${S1_MODELS[m].label} ` : '', h('b', { text: `${flipped} of ${done.length}` }));
+      });
+      this.infoEl.append(...parts, ' replacements flip at least one answer');
     }
   }
 
@@ -362,22 +378,39 @@ export class SwapPanel {
     const isBase = i === this.baseIdx;
     const tag = isBase ? 'current' : KIND_LABEL[v.kind];
     const nameCell = h('td', { class: 'swap-name' }, h('div', { class: 'swap-text', text: v.text }), h('div', { class: `kind kind-${isBase ? 'current' : v.kind}`, text: tag }));
-    const cells = specs.map(spec => {
-      const dist: Distribution | undefined = v.result?.[spec.id];
-      if (!dist) return h('td', { class: `swap-cell${v.error ? ' err' : ' wait'}` }, h('div', { class: 'shimmer' }), h('div', { class: 'shimmer short' }));
-      const top = topLabel(dist);
-      const b = base?.[spec.id];
-      const baseTop = b ? topLabel(b) : top;
-      const flip = !isBase && top !== baseTop;
-      const p = Math.round((dist[top] ?? 0) * 100);
-      const drift = !isBase && !flip && b ? Math.round(((dist[baseTop] ?? 0) - (b[baseTop] ?? 0)) * 100) : 0;
-      const title = Object.entries(dist).map(([label, q]) => `${label} ${Math.round(q * 100)}%`).join(', ');
-      return h(
-        'td',
-        { class: `swap-cell${flip ? ' flip' : ''}`, attrs: { title } },
-        h('span', { class: 'cl', text: top }),
-        h('span', { class: 'cn' }, h('span', { class: 'cp', text: `${p}%` }), drift ? h('span', { class: `cd ${drift > 0 ? 'up' : 'down'}`, text: `${drift > 0 ? '+' : '−'}${Math.abs(drift)}` }) : null)
-      );
+    const models = activeModels();
+    const cells = specs.map(s => {
+      const lines: HTMLElement[] = [];
+      let anyFlip = false;
+      let waiting = false;
+      const titles: string[] = [];
+      for (const m of models) {
+        const dist: Distribution | undefined = v.result?.[m]?.[s.id];
+        if (!dist) {
+          waiting = true;
+          continue;
+        }
+        const top = topLabel(dist);
+        const b = base?.[m]?.[s.id];
+        const baseTop = b ? topLabel(b) : top;
+        const flip = !isBase && top !== baseTop;
+        anyFlip ||= flip;
+        const p = Math.round((dist[top] ?? 0) * 100);
+        const drift = models.length === 1 && !isBase && !flip && b ? Math.round(((dist[baseTop] ?? 0) - (b[baseTop] ?? 0)) * 100) : 0;
+        titles.push(`${S1_MODELS[m].label}: ${Object.entries(dist).map(([l, q]) => `${l} ${Math.round(q * 100)}%`).join(', ')}`);
+        lines.push(
+          h(
+            'div',
+            { class: `cline m-${m}${flip ? ' flip' : ''}` },
+            models.length > 1 ? h('i', { class: 'mdot' }) : null,
+            h('span', { class: 'cl', text: top }),
+            h('span', { class: 'cn' }, h('span', { class: 'cp', text: `${p}%` }), drift ? h('span', { class: `cd ${drift > 0 ? 'up' : 'down'}`, text: `${drift > 0 ? '+' : '−'}${Math.abs(drift)}` }) : null)
+          )
+        );
+      }
+      if (!lines.length) return h('td', { class: `swap-cell${v.error ? ' err' : ' wait'}` }, h('div', { class: 'shimmer' }), h('div', { class: 'shimmer short' }));
+      if (waiting) lines.push(h('div', { class: 'shimmer short' }));
+      return h('td', { class: `swap-cell${anyFlip ? ' flip' : ''}${models.length > 1 ? ' multi' : ''}`, attrs: { title: titles.join('\n') } }, ...lines);
     });
     const row = h('tr', { class: isBase ? 'base' : '' }, nameCell, ...cells);
     if (!isBase) {

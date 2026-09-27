@@ -3,7 +3,8 @@ import { RECLASSIFY_DEBOUNCE_MS } from '../config';
 import { DialSentence } from '../dial/DialSentence';
 import { attachDial } from '../dial/interactions';
 import { ladder } from '../dial/Ladder';
-import type { Backend, Classification, QuestionSpec } from '../types';
+import { activeModels } from '../services/systemone';
+import type { Backend, Classification, MultiClassification, QuestionSpec, S1Id } from '../types';
 import { debounce, Emitter, errorMessage, h } from '../util';
 import { icons } from './icons';
 import { toast } from './toast';
@@ -13,7 +14,8 @@ export interface CardRecord {
   original: string;
   text: string;
   specs: QuestionSpec[] | null;
-  baseline: Classification | null;
+  baselines?: MultiClassification;
+  baseline?: Classification | null;
   expected?: Record<string, string>;
   source?: { dataset: string; difficulty: 'typical' | 'borderline'; note: string };
 }
@@ -37,11 +39,13 @@ export class SentenceCard {
   private readonly scheduleClassify = debounce(() => void this.classify(), RECLASSIFY_DEBOUNCE_MS);
 
   constructor(readonly record: CardRecord, private readonly deps: CardDeps) {
+    if (!record.baselines) record.baselines = record.baseline ? { jev: record.baseline } : {};
+    delete record.baseline;
     this.dial = new DialSentence(record.text, deps.backend);
     const actions = h(
       'div',
       { class: 'card-actions' },
-      h('button', { class: 'icon-btn sm', html: icons.sparkle, attrs: { title: 'New questions', 'aria-label': 'New questions' }, on: { click: () => void this.regenerateQuestions() } }),
+      h('button', { class: 'icon-btn sm', html: icons.questions, attrs: { title: 'New questions', 'aria-label': 'New questions' }, on: { click: () => void this.regenerateQuestions() } }),
       h('button', { class: 'icon-btn sm', html: icons.reset, attrs: { title: 'Reset to original', 'aria-label': 'Reset' }, on: { click: () => this.resetToOriginal() } }),
       h('button', { class: 'icon-btn sm', html: icons.close, attrs: { title: 'Remove', 'aria-label': 'Remove' }, on: { click: () => this.deps.onRemove(this) } })
     );
@@ -82,24 +86,53 @@ export class SentenceCard {
     if (this.questionsPromise) return;
     this.classifySeq++;
     this.record.specs = null;
-    this.record.baseline = null;
+    this.record.baselines = {};
     this.deps.onChange(this);
     const specs = await this.prepareQuestions();
-    if (!specs) return;
-    if (this.dial.text !== this.record.original) {
-      const seq = ++this.classifySeq;
-      try {
-        const baseline = await this.deps.backend().classify(this.record.original, specs);
-        if (seq !== this.classifySeq) return;
-        this.record.baseline = baseline;
-        this.deps.onChange(this);
-      } catch {}
-    }
-    await this.classify();
+    if (specs) await this.rebaseline(specs);
   }
 
   get specs(): QuestionSpec[] | null {
     return this.record.specs;
+  }
+
+  async modelsChanged(): Promise<void> {
+    const specs = this.record.specs;
+    if (!specs) return;
+    this.showSpecs(specs);
+    await this.rebaseline(specs, true);
+  }
+
+  private get baselines(): MultiClassification {
+    return (this.record.baselines ??= {});
+  }
+
+  private showSpecs(specs: QuestionSpec[]): void {
+    this.panel.setSpecs(specs, activeModels(), n => this.editSpec(n), this.record.expected);
+  }
+
+  private editSpec(next: QuestionSpec): void {
+    const specs = (this.record.specs ?? []).map(s => (s.id === next.id ? next : s));
+    this.record.specs = specs;
+    this.record.baselines = {};
+    this.deps.onChange(this);
+    this.showSpecs(specs);
+    this.events.emit('specs', specs);
+    void this.rebaseline(specs);
+  }
+
+  private async rebaseline(specs: QuestionSpec[], onlyMissing = false): Promise<void> {
+    if (this.dial.text !== this.record.original) {
+      const seq = ++this.classifySeq;
+      const models = activeModels().filter(m => !onlyMissing || !this.baselines[m]);
+      const results = await Promise.allSettled(models.map(m => this.deps.backend().classify(this.record.original, specs, m)));
+      if (seq !== this.classifySeq) return;
+      results.forEach((res, i) => {
+        if (res.status === 'fulfilled') this.baselines[models[i]] = res.value;
+      });
+      this.deps.onChange(this);
+    }
+    await this.classify();
   }
 
   resetToOriginal(): void {
@@ -114,33 +147,6 @@ export class SentenceCard {
     for (const off of this.unsubscribe) off();
     this.dial.events.clear();
     this.events.clear();
-  }
-
-  private showSpecs(specs: QuestionSpec[]): void {
-    this.panel.setSpecs(specs, next => this.editSpec(next), this.record.expected);
-  }
-
-  private editSpec(next: QuestionSpec): void {
-    const specs = (this.record.specs ?? []).map(s => (s.id === next.id ? next : s));
-    this.record.specs = specs;
-    this.record.baseline = null;
-    this.deps.onChange(this);
-    this.showSpecs(specs);
-    this.events.emit('specs', specs);
-    void this.regenerateBaseline(specs);
-  }
-
-  private async regenerateBaseline(specs: QuestionSpec[]): Promise<void> {
-    if (this.dial.text !== this.record.original) {
-      const seq = ++this.classifySeq;
-      try {
-        const baseline = await this.deps.backend().classify(this.record.original, specs);
-        if (seq !== this.classifySeq) return;
-        this.record.baseline = baseline;
-        this.deps.onChange(this);
-      } catch {}
-    }
-    await this.classify();
   }
 
   private prepareQuestions(): Promise<QuestionSpec[] | null> {
@@ -175,21 +181,24 @@ export class SentenceCard {
     if (!specs) return;
     const seq = ++this.classifySeq;
     const text = this.dial.text;
+    const models: S1Id[] = activeModels();
     this.panel.setBusy(true);
-    try {
-      const result = await this.deps.backend().classify(text, specs);
-      if (seq !== this.classifySeq) return;
-      if (!this.record.baseline && text === this.record.original) {
-        this.record.baseline = result;
-        this.deps.onChange(this);
-      }
-      this.panel.clearError();
-      this.panel.update(result, this.record.baseline);
-    } catch (err) {
-      if (seq === this.classifySeq) this.panel.showError(errorMessage(err), () => void this.classify());
-    } finally {
-      if (seq === this.classifySeq) this.panel.setBusy(false);
-    }
+    const settled = await Promise.allSettled(models.map(m => this.deps.backend().classify(text, specs, m)));
+    if (seq !== this.classifySeq) return;
+    const results: MultiClassification = {};
+    const errors: string[] = [];
+    settled.forEach((res, i) => {
+      const m = models[i];
+      if (res.status === 'fulfilled') {
+        results[m] = res.value;
+        if (!this.baselines[m] && text === this.record.original) this.baselines[m] = res.value;
+      } else errors.push(errorMessage(res.reason));
+    });
+    if (text === this.record.original) this.deps.onChange(this);
+    this.panel.clearError();
+    this.panel.update(results, this.baselines);
+    if (errors.length) this.panel.showError(errors.join(' · '), () => void this.classify());
+    this.panel.setBusy(false);
   }
 
   private setStatus(text: string, error: boolean): void {

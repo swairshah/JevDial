@@ -1,4 +1,5 @@
-import { DEFAULT_JEV, DEFAULT_LLM, DEFAULT_QUESTION_LLM } from './config';
+import { DEFAULT_JEV, DEFAULT_KEV, DEFAULT_LLM, DEFAULT_QUESTION_LLM } from './config';
+import type { S1Id } from './types';
 import { Emitter } from './util';
 
 export type ThemeMode = 'system' | 'light' | 'dark';
@@ -9,6 +10,8 @@ export interface Settings {
   llmModel: string;
   questionModel: string;
   jevModel: string;
+  kevModel: string;
+  s1: S1Id[];
   jevEndpoint: string;
   haptics: boolean;
   sound: boolean;
@@ -55,6 +58,8 @@ export const settings: Settings = {
   llmModel: DEFAULT_LLM,
   questionModel: DEFAULT_QUESTION_LLM,
   jevModel: DEFAULT_JEV,
+  kevModel: DEFAULT_KEV,
+  s1: ['jev'],
   jevEndpoint: 'auto',
   haptics: true,
   sound: true,
@@ -72,6 +77,8 @@ export function loadSettings(): void {
   const prefs = storage.getJSON<StoredPrefs>('prefs', {});
   const { version, invert, remember, ...rest } = prefs;
   Object.assign(settings, rest);
+  settings.s1 = (Array.isArray(settings.s1) ? settings.s1 : []).filter((m): m is S1Id => m === 'jev' || m === 'kev');
+  if (!settings.s1.length) settings.s1 = ['jev'];
   if (invert !== undefined) settings.invertScroll = invert;
   if (remember !== undefined) settings.rememberKeys = remember;
   if ((version ?? 0) < PREFS_VERSION) settings.llmModel = DEFAULT_LLM;

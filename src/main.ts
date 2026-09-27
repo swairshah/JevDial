@@ -1,6 +1,6 @@
 import { App } from './app';
 import { installDialInteractions } from './dial/interactions';
-import { hasJevAccess } from './services/jev';
+import { activeModels, hasS1Access } from './services/systemone';
 import { hasLlmAccess } from './services/openrouter';
 import { detectProxy } from './services/proxy';
 import { loadSettings, settings } from './settings';
@@ -16,7 +16,7 @@ async function main(): Promise<void> {
   const root = document.getElementById('app');
   if (!root) throw new Error('#app not found');
   const app = new App(root);
-  if (!settings.mock && !hasLlmAccess() && !hasJevAccess()) app.openSettings();
+  if (!settings.mock && !hasLlmAccess() && !activeModels().some(hasS1Access)) app.openSettings();
 }
 
 void main();

@@ -1,9 +1,9 @@
 import { currentBackend } from './backends';
 import { SEED_SENTENCE } from './config';
-import { DatasetPage, type OpenMode } from './dataset/DatasetPage';
 import { settings, settingsEvents, storage } from './settings';
-import type { Dataset } from './types';
 import { Composer } from './ui/Composer';
+import { DatasetPage, type OpenMode } from './dataset/DatasetPage';
+import type { Dataset } from './types';
 import { Header, type Route } from './ui/Header';
 import { SentenceCard, type CardRecord } from './ui/SentenceCard';
 import { SettingsDialog } from './ui/SettingsDialog';
@@ -21,7 +21,7 @@ export class App {
   private readonly shell = h('div', { class: 'shell' });
   private readonly playground = h('div', { class: 'page' });
   private readonly datasetPage = new DatasetPage({ backend: currentBackend, onOpen: (ds, mode) => this.openDataset(ds, mode) });
-  private readonly header: Header;
+  private header!: Header;
   private readonly swap = new SwapPanel({
     backend: currentBackend,
     onVisibilityChange: open => this.shell.classList.toggle('with-swap', open)
@@ -40,11 +40,18 @@ export class App {
     settingsEvents.on('change', ({ previous }) => {
       applyTheme(settings.theme);
       const backendChanged =
-        previous.mock !== settings.mock || previous.llmModel !== settings.llmModel || previous.jevModel !== settings.jevModel || previous.jevEndpoint !== settings.jevEndpoint;
+        previous.mock !== settings.mock ||
+        previous.llmModel !== settings.llmModel ||
+        previous.jevModel !== settings.jevModel ||
+        previous.kevModel !== settings.kevModel ||
+        previous.jevEndpoint !== settings.jevEndpoint;
       const keysAdded = (!previous.orKey && !!settings.orKey) || (!previous.tsKey && !!settings.tsKey);
       if (backendChanged || keysAdded) {
         this.swap.close();
         for (const card of this.cards) void card.restart();
+      } else if (previous.s1.join() !== settings.s1.join()) {
+        for (const card of this.cards) void card.modelsChanged();
+        this.swap.modelsChanged();
       }
     });
     const stored = storage.getJSON<CardRecord[]>(STORE_KEY, []);
@@ -71,7 +78,7 @@ export class App {
           original: item.text,
           text: item.text,
           specs: ds.specs.map(s => ({ ...s, options: s.options.map(o => ({ ...o })) })),
-          baseline: null,
+          baselines: {},
           expected: item.labels,
           source: { dataset: ds.title, difficulty: item.difficulty, note: item.note }
         },
@@ -88,7 +95,7 @@ export class App {
   }
 
   add(text: string): void {
-    this.mount({ id: uid(), original: text, text, specs: null, baseline: null }, true);
+    this.mount({ id: uid(), original: text, text, specs: null, baselines: {} }, true);
     this.persist();
   }
 

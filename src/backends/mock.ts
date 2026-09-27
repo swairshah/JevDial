@@ -100,8 +100,8 @@ export const mockBackend: Backend = {
     return mockItems(design, count);
   },
 
-  async classifyMany(sentences, specs) {
-    return Promise.all(sentences.map(sentence => this.classify(sentence, specs)));
+  async classifyMany(sentences, specs, model) {
+    return Promise.all(sentences.map(s => this.classify(s, specs, model)));
   },
 
   async proposeSwaps(req) {
@@ -111,14 +111,16 @@ export const mockBackend: Backend = {
     return pool.slice(0, 10).map((text, i) => ({ text, kind: (['synonym', 'stronger', 'weaker', 'opposite', 'formal', 'casual', 'shift'] as const)[i % 7] }));
   },
 
-  async classify(sentence, specs) {
+  async classify(sentence, specs, model) {
     await sleep(250 + Math.random() * 200);
-    const v = sentenceValence(sentence);
+    const raw = sentenceValence(sentence);
+    const v = model === 'kev' ? Math.max(-1, Math.min(1, raw * 0.6 - 0.15)) : raw;
+    const width = model === 'kev' ? 1.6 : 0.9;
     return Object.fromEntries(
       specs.map(spec => {
         const n = spec.options.length;
         const center = ((1 - v) / 2) * (n - 1);
-        const raw = Object.fromEntries(spec.options.map((o, i) => [o.label, Math.exp(-((i - center) ** 2) / 0.9)]));
+        const raw = Object.fromEntries(spec.options.map((o, i) => [o.label, Math.exp(-((i - center) ** 2) / width)]));
         return [spec.id, normalizeDistribution(spec, raw)];
       })
     );

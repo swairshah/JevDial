@@ -15,19 +15,35 @@ import {
   WORD_KIND_CRITERIA
 } from '../prompts';
 import { chatJSON, hasLlmAccess } from '../services/openrouter';
-import { systemOne, systemOneBatched, type JevQuestions } from '../services/jev';
+import { primaryModel, S1_MODELS, systemOne, systemOneBatched, type S1Answer, type S1Questions } from '../services/systemone';
 import { QUESTION_FALLBACK_LLMS } from '../config';
 import { DESIGN_SCHEMA, DESIGN_SYSTEM, ITEMS_SCHEMA, ITEMS_SYSTEM } from '../dataset/prompts';
 import { normalizeDesign, normalizeItems, type RawDesign, type RawItems } from '../dataset/normalize';
 import { settings } from '../settings';
-import type { Backend, StepResult, SwapKind, SwapOption, WordKind, WordRef, WordTag } from '../types';
+import type { Backend, QuestionSpec, S1Id, StepResult, SwapKind, SwapOption, WordKind, WordRef, WordTag } from '../types';
 import { errorMessage, num } from '../util';
 
 const key = (index: number) => `w${index}`;
 
-async function tagWithJev(sentence: string, words: WordRef[]): Promise<WordTag[]> {
+const levelScore = (a: S1Answer | undefined, levels: string[]): number | null => {
+  if (!a) return null;
+  if (a.type === 'score') return a.score;
+  if (a.type !== 'choice') return null;
+  let s = 0;
+  let total = 0;
+  levels.forEach((l, i) => {
+    const p = a.probabilities?.[l] ?? 0;
+    s += i * p;
+    total += p;
+  });
+  return total > 0 ? s / total : null;
+};
+
+const levelCriteria = (levels: string[]) => Object.fromEntries(levels.map(l => [l, null]));
+
+async function tagWithS1(model: S1Id, sentence: string, words: WordRef[]): Promise<WordTag[]> {
   const state = { sentence, words: Object.fromEntries(words.map(w => [key(w.index), w.text])) };
-  const kindQuestions: JevQuestions = {};
+  const kindQuestions: S1Questions = {};
   for (const w of words) {
     kindQuestions[key(w.index)] = {
       type: 'choice',
@@ -35,7 +51,7 @@ async function tagWithJev(sentence: string, words: WordRef[]): Promise<WordTag[]
       criteria: WORD_KIND_CRITERIA
     };
   }
-  const kinds = await systemOneBatched(state, kindQuestions);
+  const kinds = await systemOneBatched(model, state, kindQuestions);
   const flagged: { word: WordRef; kind: WordKind; confidence: number }[] = [];
   for (const word of words) {
     const a = kinds[key(word.index)];
@@ -45,17 +61,16 @@ async function tagWithJev(sentence: string, words: WordRef[]): Promise<WordTag[]
     flagged.push({ word, kind: a.choice as WordKind, confidence: 1 - (p.fixed ?? 0) });
   }
   if (!flagged.length) return [];
-  const scoreQuestions: JevQuestions = {};
+  const scoreQuestions: S1Questions = {};
   for (const { word, kind } of flagged) {
     scoreQuestions[key(word.index)] =
       kind === 'degree'
-        ? { type: 'score', instructions: `How strong a degree does \`words.${key(word.index)}\` express as used in \`sentence\`?`, criteria: DEGREE_LEVELS }
-        : { type: 'score', instructions: `How negative or positive does \`words.${key(word.index)}\` read as used in \`sentence\`?`, criteria: VALENCE_LEVELS };
+        ? { type: 'choice', instructions: `How strong a degree does \`words.${key(word.index)}\` express as used in \`sentence\`?`, criteria: levelCriteria(DEGREE_LEVELS) }
+        : { type: 'choice', instructions: `How negative or positive does \`words.${key(word.index)}\` read as used in \`sentence\`?`, criteria: levelCriteria(VALENCE_LEVELS) };
   }
-  const scores = await systemOneBatched(state, scoreQuestions);
+  const scores = await systemOneBatched(model, state, scoreQuestions);
   return flagged.map(({ word, kind, confidence }) => {
-    const a = scores[key(word.index)];
-    const s = a?.type === 'score' ? a.score : null;
+    const s = levelScore(scores[key(word.index)], kind === 'degree' ? DEGREE_LEVELS : VALENCE_LEVELS);
     if (kind === 'degree') return { index: word.index, kind, confidence, valence: 0, intensity: s === null ? 0.5 : s / 3 };
     return { index: word.index, kind, confidence, valence: s === null ? 0 : (s - 2) / 2, intensity: s === null ? 0.5 : Math.abs(s - 2) / 2 };
   });
@@ -86,6 +101,13 @@ async function tagWithLlm(sentence: string, words: WordRef[]): Promise<WordTag[]
     }));
 }
 
+const criteriaOf = (spec: QuestionSpec) => Object.fromEntries(spec.options.map(o => [o.label, o.description || null]));
+
+function distributionOf(spec: QuestionSpec, answer: S1Answer | undefined) {
+  const probs = answer?.type === 'choice' ? answer.probabilities : answer?.type === 'score' ? answer.probabilities : undefined;
+  return normalizeDistribution(spec, probs);
+}
+
 interface SwapJSON {
   alternatives?: { text?: string; kind?: string }[];
 }
@@ -101,8 +123,9 @@ export const liveBackend: Backend = {
   id: 'live',
 
   async tagWords(sentence, words) {
+    const model = primaryModel();
     try {
-      return { tags: await tagWithJev(sentence, words), source: 'Jev' };
+      return { tags: await tagWithS1(model, sentence, words), source: S1_MODELS[model].label };
     } catch (err) {
       if (!hasLlmAccess()) throw err;
       const tags = await tagWithLlm(sentence, words);
@@ -152,26 +175,29 @@ export const liveBackend: Backend = {
     return normalizeQuestions(res.questions);
   },
 
-  async classify(sentence, specs) {
-    const questions: JevQuestions = {};
+  async classify(sentence, specs, model) {
+    const questions: S1Questions = {};
     for (const spec of specs) {
-      questions[spec.id] = {
-        type: 'choice',
-        instructions: `${spec.question} Answer about \`sentence\`.`,
-        criteria: Object.fromEntries(spec.options.map(o => [o.label, o.description || null]))
-      };
+      questions[spec.id] = { type: 'choice', instructions: `${spec.question} Answer about \`sentence\`.`, criteria: criteriaOf(spec) };
     }
-    const answers = await systemOne({ sentence }, questions);
-    return Object.fromEntries(
-      specs.map(spec => {
-        const a = answers[spec.id];
-        return [spec.id, normalizeDistribution(spec, a?.type === 'choice' ? a.probabilities : a?.type === 'score' ? a.probabilities : undefined)];
-      })
-    );
+    const answers = await systemOne(model, { sentence }, questions);
+    return Object.fromEntries(specs.map(spec => [spec.id, distributionOf(spec, answers[spec.id])]));
   },
 
-  async classifyMany(sentences, specs) {
-    return Promise.all(sentences.map(sentence => this.classify(sentence, specs)));
+  async classifyMany(sentences, specs, model) {
+    const state = { sentences: Object.fromEntries(sentences.map((s, i) => [`v${i}`, s])) };
+    const questions: S1Questions = {};
+    sentences.forEach((_, i) => {
+      for (const spec of specs) {
+        questions[`v${i}_${spec.id}`] = {
+          type: 'choice',
+          instructions: `${spec.question} Answer about \`sentences.v${i}\` on its own; the other sentences are unrelated variants.`,
+          criteria: criteriaOf(spec)
+        };
+      }
+    });
+    const answers = await systemOneBatched(model, state, questions);
+    return sentences.map((_, i) => Object.fromEntries(specs.map(spec => [spec.id, distributionOf(spec, answers[`v${i}_${spec.id}`])])));
   },
 
   async proposeSwaps(req) {

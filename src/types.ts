@@ -57,6 +57,9 @@ export interface QuestionSpec {
 export type Distribution = Record<string, number>;
 export type Classification = Record<string, Distribution>;
 
+export type S1Id = 'jev' | 'kev';
+export type MultiClassification = Partial<Record<S1Id, Classification>>;
+
 export type SwapKind = 'synonym' | 'stronger' | 'weaker' | 'opposite' | 'formal' | 'casual' | 'shift' | 'custom';
 
 export interface SwapOption {
@@ -107,8 +110,8 @@ export interface Backend {
   tagWords(sentence: string, words: WordRef[]): Promise<TagResult>;
   nextRung(request: StepRequest): Promise<StepResult>;
   proposeQuestions(sentence: string): Promise<QuestionSpec[]>;
-  classify(sentence: string, specs: QuestionSpec[]): Promise<Classification>;
-  classifyMany(sentences: string[], specs: QuestionSpec[]): Promise<Classification[]>;
+  classify(sentence: string, specs: QuestionSpec[], model: S1Id): Promise<Classification>;
+  classifyMany(sentences: string[], specs: QuestionSpec[], model: S1Id): Promise<Classification[]>;
   proposeSwaps(request: SwapRequest): Promise<SwapOption[]>;
   designDataset(description: string, questionCount: number): Promise<DatasetDesign>;
   writeDatasetItems(design: DatasetDesign, count: number, focus?: string[]): Promise<DatasetItem[]>;

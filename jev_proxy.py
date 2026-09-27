@@ -29,12 +29,14 @@ load_env(ROOT / ".env")
 
 JEV_UPSTREAM = os.environ.get("TYPESAFE_BASE_URL", "https://api.typesafe.ai").rstrip("/") + "/v1/systemone"
 LLM_UPSTREAM = "https://openrouter.ai/api/v1/chat/completions"
+KEV_UPSTREAM = "https://openrouter.ai/api/v1/systemone"
 JEV_KEY = os.environ.get("TYPESAFE_API_KEY", "")
 LLM_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 
 ROUTES = {
     "/api/jev": (JEV_UPSTREAM, JEV_KEY, "TYPESAFE_API_KEY"),
     "/api/llm": (LLM_UPSTREAM, LLM_KEY, "OPENROUTER_API_KEY"),
+    "/api/kev": (KEV_UPSTREAM, LLM_KEY, "OPENROUTER_API_KEY"),
 }
 
 

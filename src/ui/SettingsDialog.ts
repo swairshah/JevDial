@@ -3,7 +3,7 @@ import { proxy } from '../services/proxy';
 import { settings, updateSettings, type Settings } from '../settings';
 import { h } from '../util';
 
-type TextKey = 'orKey' | 'tsKey' | 'llmModel' | 'questionModel' | 'jevModel' | 'jevEndpoint';
+type TextKey = 'orKey' | 'tsKey' | 'llmModel' | 'questionModel' | 'jevModel' | 'kevModel' | 'jevEndpoint';
 type BoolKey = 'haptics' | 'sound' | 'invertScroll' | 'rememberKeys' | 'mock';
 
 const TEXT_FIELDS: { key: TextKey; label: string; secret?: boolean; list?: string[] }[] = [
@@ -11,7 +11,8 @@ const TEXT_FIELDS: { key: TextKey; label: string; secret?: boolean; list?: strin
   { key: 'tsKey', label: 'TypeSafe API key', secret: true },
   { key: 'llmModel', label: 'Word model', list: LLM_CHOICES },
   { key: 'questionModel', label: 'Question model', list: QUESTION_LLM_CHOICES },
-  { key: 'jevModel', label: 'Jev model' },
+  { key: 'jevModel', label: 'Jev checkpoint' },
+  { key: 'kevModel', label: 'Kev checkpoint' },
   { key: 'jevEndpoint', label: 'Jev endpoint' }
 ];
 
@@ -36,7 +37,7 @@ export class SettingsDialog {
       this.inputs.set(f.key, input);
       const list = f.list ? h('datalist', { attrs: { id: `${id}-list` } }, ...f.list.map(v => h('option', { attrs: { value: v } }))) : null;
       if (list) input.setAttribute('list', `${id}-list`);
-      return h('div', { class: `field${f.key === 'llmModel' || f.key === 'questionModel' ? ' half' : ''}` }, h('label', { text: f.label, attrs: { for: id } }), input, list);
+      return h('div', { class: `field${['llmModel', 'questionModel', 'jevModel', 'kevModel'].includes(f.key) ? ' half' : ''}` }, h('label', { text: f.label, attrs: { for: id } }), input, list);
     });
     const toggles = TOGGLES.map(t => {
       const input = h('input', { attrs: { type: 'checkbox' } });
@@ -76,6 +77,7 @@ export class SettingsDialog {
     patch.llmModel ||= settings.llmModel;
     patch.questionModel ||= settings.questionModel;
     patch.jevModel ||= settings.jevModel;
+    patch.kevModel ||= settings.kevModel;
     patch.jevEndpoint ||= 'auto';
     updateSettings(patch);
   }

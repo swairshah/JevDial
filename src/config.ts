@@ -8,6 +8,8 @@ export const DEFAULT_QUESTION_LLM = 'google/gemini-3.8-flash';
 export const QUESTION_FALLBACK_LLMS = ['anthropic/claude-opus-5.5', DEFAULT_LLM];
 export const QUESTION_LLM_CHOICES = [DEFAULT_QUESTION_LLM, 'anthropic/claude-opus-5.5', DEFAULT_LLM];
 export const DEFAULT_JEV = 'jev-latest';
+export const DEFAULT_KEV = 'jaredpalmer/kev-4b';
+export const OPENROUTER_SYSTEMONE_URL = 'https://openrouter.ai/api/v1/systemone';
 
 export const SEED_SENTENCE = 'The food was good, but the service was pretty slow and our waiter seemed annoyed.';
 
